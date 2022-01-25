@@ -1,0 +1,319 @@
+
+```{r}
+library(data.table)
+library(readxl)
+library(openxlsx)
+library(ggplot2)
+library(maptools)
+library(foreign)
+library(plyr)
+library(haven)
+
+print ("_-")
+```
+
+```{r}
+knitr::opts_knit$set(root.dir = normalizePath("/Volumes/GoogleDrive/My Drive/SRTR/R_files//"))
+getwd()
+```
+
+```{r}
+state_agg = 1
+agg_level = "G6AC"
+sheet_MELD_class = paste0("transition_agg_", agg_level) # "transition_agg_G11" # "transition_agg_SIMPLE"
+
+MELD_col_name = "CANHX_STAT_CD" # "CANHX_OPTN_LAB_MELD" # "CANHX_STAT_CD" # "CANHX_SRTR_LAB_MELD  # Columns to indicate the MELD during the WL period
+MELD_col_desp_name = paste0(MELD_col_name, "_desp")
+```
+
+```{r}
+df_src = read.csv("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/stathist_liin_v2.csv")
+names(df_src)
+samp = subset(df_src, PX_ID == "987207")
+```
+
+```{r}
+df = df_src
+
+df$MELD_col = df[, MELD_col_name]
+df$MELD_col_desp = df[, MELD_col_desp_name]
+
+# Aggregate the states:
+if (state_agg == 1) {
+  ref = read_excel("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/ptr_li_sample.xlsx", sheet = sheet_MELD_class)
+  df = merge(df, unique(ref), by.x = c("MELD_col", "MELD_col_desp"), by.y = c("CANHX_STAT_CD", "CANHX_STAT_CD_desp"), all.x = T)
+  df = df[, -which(names(df) %in% c("MELD_col", "MELD_col_desp"))]
+  
+  # Rename the column back to original:
+  names(df)[which(names(df) %in% c("new_CANHX_STAT_CD"))] = "MELD_col"
+  names(df)[which(names(df) %in% c("new_CANHX_STAT_CD_desp"))] = "MELD_col_desp"
+  
+  unique(df[, "MELD_col_desp"])
+}
+```
+
+# Adding "nxt_MELD_col" (j of transition ij); Thus, we use the first obersvation. 
+```{r}
+# Order the dataframe, so that events are in the chronological order:
+df$CANHX_BEGIN_DT = as.Date(df$CANHX_BEGIN_DT)
+
+df = df[with(df, order(PX_ID, CANHX_BEGIN_DT)), ]; row.names(df) = c(1:nrow(df))
+
+# For every PX_ID, to add the "next_CANHX_STAT_CD", remove the first row of CANHX_STAT_CD, and CANHX_STAT_CD_desp:
+df = data.table(df)[, nxt_MELD_col:= c(MELD_col[-1], NA), by = c("PX_ID")]
+df$MELD_col_desp = as.character(df$MELD_col_desp)
+df = data.table(df)[, nxt_MELD_col_desp:= c(MELD_col_desp[-1], NA), by = c("PX_ID")]
+df = data.frame(df)[, c(1:6, 35:38, 7:34)]
+df = df[, -which(names(df) %in% c("MELD_col", "nxt_MELD_col"))]
+```
+
+Examining the last record of each PX_ID:
+Case 1: Patient still on the WL ('time_period' is also empty, in addition to 'nxt_CANHX_STAT_CD')
+Case 2: Patient removed from the WL ('CANHX_END_DT' and 'CAN_REM_DT' are equal, implying that 'CAN_REM_CD_desp' should be 'nxt_CANHX_STAT_CD_desp')
+```{r} 
+# candidates who are still on the WL (i.e., CAN_REM_DT is empty):
+uniqueN(subset(df, is.na(CAN_REM_DT))$PX_ID) ; uniqueN(df$PX_ID)   # 13485 out of 189277, 7.12%
+temp = subset(df, is.na(CAN_REM_DT) & is.na(nxt_MELD_col_desp))
+
+# To check if CAN_REM_DT is not empty, the last observation has same CANHX_END_DT and CAN_REM_DT: YES!
+temp = subset(df, !is.na(CAN_REM_DT) & is.na(nxt_MELD_col_desp))
+all(as.Date(temp$CANHX_END_DT) == as.Date(temp$CAN_REM_DT))
+
+# For Case 2, for the last observation, update "nxt_MELD_col_desp" to "CAN_REM_CD_desp":
+cond = (!is.na(df$CAN_REM_DT) & is.na(df$nxt_MELD_col_desp))
+sum(is.na(df$nxt_MELD_col_desp))  # 189277
+df$CAN_REM_CD_desp = as.character(df$CAN_REM_CD_desp)
+df[cond, c("nxt_MELD_col_desp")] = df[cond, c("CAN_REM_CD_desp")]
+sum(is.na(df$nxt_MELD_col_desp))  # 13535, Why not equal to 13485?? Where's the discrepency of 50 coming from?
+
+uniqueN(df[is.na(df$nxt_MELD_col_desp), ]$PX_ID)
+temp = subset(df, is.na(nxt_MELD_col_desp) & !is.na(CAN_REM_DT)) # "CAN_REM_CD" is NA for these 50 discrepency!
+# unique(df$nxt_MELD_col_desp)
+```
+
+Import Candidates' age info:
+```{r}
+wl = read.csv("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/waitlist.csv")
+tx = read.csv("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/tx.csv")
+
+# Vlookup CANDIDATE's information using PX_ID:
+wl1 = wl[, c("PX_ID", "CAN_ABO", "CAN_AGE_IN_MONTHS_AT_LISTING", "CAN_OPO_CD", "CAN_OPO_REGION", "CAN_CTR_CD")]
+
+tx1 = tx[, c(intersect(names(wl1), names(tx)), "REC_OPO_CD", "REC_OPO_REGION", "REC_CTR_CD")]
+names(tx1)[4:6] = c("CAN_OPO_CD", "CAN_OPO_REGION", "CAN_CTR_CD")
+
+# Are there any PX_ID in tx that were not found in wl:
+uniqueN(c(wl$PX_ID, tx$PX_ID)) - uniqueN(wl$PX_ID)  # 248 new PX_IDs in tx:
+tx1 = subset(tx1, PX_ID %in% setdiff(union(wl$PX_ID, tx$PX_ID), wl$PX_ID))
+
+wl1 = lapply(wl1, as.character)
+tx1 = lapply(tx1, as.character)
+
+wl1_com = dplyr::bind_rows(wl1, tx1)
+
+# Add CAN info:
+intersect(names(df), names(wl1_com))
+df = merge(df, wl1_com, by = "PX_ID", all.x = T)
+```
+
+# Filter based on Age:
+```{r}
+df$CAN_AGE_IN_MONTHS_AT_LISTING = as.numeric(df$CAN_AGE_IN_MONTHS_AT_LISTING)
+# hist(df$CAN_AGE_IN_MONTHS_AT_LISTING)
+
+df$pat_type = "adult"
+df[(!is.na(df$CAN_AGE_IN_MONTHS_AT_LISTING) & df$CAN_AGE_IN_MONTHS_AT_LISTING < 18*12), "pat_type"] = "pediatric"
+table(df$pat_type)
+
+df = df[with(df, order(PX_ID, CANHX_BEGIN_DT)), ]; row.names(df) = c(1:nrow(df))
+```
+
+# Estimate TRANSITION PROBABILITY MATRIX:
+
+To account for underestimation of "time_period" when two subsequent rows can be combined:
+When two subsequent rows can be combined, the "time_period" is underestimated. Therefore, calculate "time_period_extra":
+```{r}
+# "time_period" is just the difference between CANHX_BEGIN_DT, and CANHX_END_DT. But, it is not enough to calculate transition marix:
+f_comb = function(PX_ID, CANHX_BEGIN_DT, CANHX_END_DT, MELD_col_desp, nxt_MELD_col_desp) {    # For cases like PX_ID = 362432
+ #  print(PX_ID)
+  temp = data.frame(st_date = CANHX_BEGIN_DT, end_date = CANHX_END_DT, st_i = MELD_col_desp, st_j = nxt_MELD_col_desp)
+  temp$time_period_extra = 0
+  
+  if (nrow(temp) > 1) {
+    for (k in c(1:(nrow(temp)-1))) {
+      if ((temp$st_i[k] == temp$st_j[k]) & (temp$st_j[k] == temp$st_i[k+1])) {
+        temp$time_period_extra[k] = 1
+      }
+    }
+    return(temp[, c("time_period_extra")])
+  }
+}
+
+# Consider PX_ID = 362432/362548 to see the problem and solution:
+# samp = subset(df, PX_ID == "363258")
+# samp = samp[, c("PX_ID", "time_period", "CANHX_BEGIN_DT", "CANHX_END_DT", "MELD_col_desp", "nxt_MELD_col_desp")]
+# #names(samp) = c("st_date", "end_date", "st_i", "st_j")
+# samp = data.table(samp)[, time_period_extra := f_comb(PX_ID, CANHX_BEGIN_DT, CANHX_END_DT, MELD_col_desp, nxt_MELD_col_desp), by = PX_ID]
+
+df = df[!(df$PX_ID %in% unique(df[is.na(df$MELD_col_desp), "PX_ID"])), ]
+df = data.table(df)[, time_period_extra := f_comb(PX_ID, CANHX_BEGIN_DT, CANHX_END_DT, MELD_col_desp, nxt_MELD_col_desp), by = PX_ID]
+df$time_period_adj = rowSums(df[, c("time_period", "time_period_extra")], na.rm = TRUE)
+df$time_period_wait = df$time_period + 1
+
+df = df[, c(1:5, 43:45, 6:42)]
+df = df[with(df, order(PX_ID, CANHX_BEGIN_DT)), ]; row.names(df) = c(1:nrow(df))
+```
+
+# Write the file:
+```{r}
+if (state_agg == 1) {
+  write.csv(df, paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/", agg_level, "/stathist_liin_nxt_state_time_adj_", agg_level, "_", MELD_col_name, ".csv"), row.names = F)
+} else {
+  write.csv(df, paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/", agg_level, "/stathist_liin_nxt_state_time_adj", "_", MELD_col_name, ".csv"), row.names = F)
+}
+df = read.csv(paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/", agg_level, "/", MELD_col_name,  "/stathist_liin_nxt_state_time_adj_", agg_level, "_", MELD_col_name, ".csv"))
+```
+
+
+Consider only "Adult patients":
+```{r}
+df1 = subset(df, pat_type == "adult")
+
+# Remove PX_IDs with associated MELD < 6, >40:
+#table(df1$nxt_CANHX_STAT_CD_desp)
+temp = df1
+temp$STAT1 = as.numeric(sapply(temp$MELD_col_desp, function(x) {strsplit(as.character(x), split = " ")[[1]][2]}))  # Can output "NAs introduced by coercion"...for '6-14, 15-24,'
+temp$STAT2 = as.numeric(sapply(temp$nxt_MELD_col_desp, function(x) {strsplit(as.character(x), split = " ")[[1]][2]}))
+
+rem_PX_IDs = unique(subset(temp, (((STAT1 < 6) | (STAT1 > 40)) & (STAT1 != 1)))$PX_ID)  # !=1 since we don not want to consider 'Status 1' cases.
+rem_PX_IDs = unique(c(rem_PX_IDs, subset(temp, (((STAT2 < 6) | (STAT2 > 40)) & (STAT2 != 1)))$PX_ID))
+rem_PX_IDs = unique(c(rem_PX_IDs, subset(temp, ((MELD_col_desp == "MELD/PELD 1") | (nxt_MELD_col_desp == "MELD/PELD 1")))$PX_ID))
+
+# Remove PX_ID associated with "Temporarily Inactive":
+if(remove_Inactive == 1) {
+  remove_Inactive = 1
+  rem_PX_IDs = unique(c(rem_PX_IDs, subset(temp, ((MELD_col_desp == "Temporarily Inactive") | (nxt_MELD_col_desp == "Temporarily Inactive")))$PX_ID))
+  # df1 = subset(df1, !(PX_ID %in% rem_PX_IDs))
+}    # 1230286 out of 2171060 cases, 56.67% cases
+
+df1 = subset(df1, !(PX_ID %in% rem_PX_IDs)) # 2170282 out of 2171060 cases, 99.96% cases
+```
+
+```{r}
+# Patient-wise reasons for removal from WL:
+# table(unique(df1[, c("PX_ID", "CAN_REM_CD_desp")])$CAN_REM_CD_desp)
+# temp = subset(df, CANHX_STAT_CD == nxt_CANHX_STAT_CD)
+# table(df1$nxt_CANHX_STAT_CD_desp)
+```
+
+```{r}
+temp = df1[df1$PX_ID == 362485,]
+df11 = df1[, c("MELD_col_desp", "nxt_MELD_col_desp", "time_period_adj")]
+df11[, c(1, 2)] = lapply(df11[, c(1, 2)], as.character)
+```
+
+For the last observation of each PX_ID, only these j states: "Died", "Candidate condition deteriorated , too sick for tx", "Candidate condition improved, tx not needed" are relevant.
+
+# Self-transitions and cross-transitions:
+```{r}
+# Same state transitions, (i->i): Filter all with (i->anything), and sum (time_period_adj)
+# Cross state transitions, (i->j): Count such transitions.
+# For illustration, select PX_ID = 362485. Same state transitions should be 11, an 56.
+
+df2_same = data.table(df11)[, list(transitions_cnt = sum(time_period_adj)), by = list(MELD_col_desp)] # transitions_cnt = cnt_same_state_transitions
+df2_same$nxt_MELD_col_desp = df2_same$MELD_col_desp
+df2_cross = data.table(df11[df11$MELD_col_desp != df11$nxt_MELD_col_desp, ])[, list(transitions_cnt = .N), by = list(MELD_col_desp, nxt_MELD_col_desp)]  # transitions_cnt = cnt_other_state_transitions
+df2 = rbind(df2_cross, df2_same)
+```
+
+# Write the file:
+```{r}
+if (state_agg == 1) {
+  write.csv(df2, paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/", agg_level, "/state_transition_", agg_level, "_", MELD_col_name,".csv"), row.names = F)
+} else {
+  write.csv(df2, paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/", agg_level, "/state_transition_", MELD_col_name,".csv"), row.names = F)
+}
+
+df2 = read.csv(paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/", agg_level, "/", MELD_col_name, "/state_transition_", agg_level, "_", MELD_col_name,".csv"))
+```
+
+```{r}
+#unique(df2$nxt_MELD_col_desp)
+too_sick_for_tx_TO = "Died"    # 'Died', 'MELD/PELD >34', 'MELD_high'
+```
+
+# Transition matrix:
+```{r}
+library(tidyr)
+
+df2[df2$nxt_MELD_col_desp == "Candidate condition deteriorated , too sick for tx", "nxt_MELD_col_desp"] = too_sick_for_tx_TO
+if (grepl(agg_level, "G2") | grepl(agg_level, "G2_")) {
+  df2[df2$nxt_MELD_col_desp == "Candidate condition improved, tx not needed", "nxt_MELD_col_desp"] = "MELD_low"
+} else {
+  df2[df2$nxt_MELD_col_desp == "Candidate condition improved, tx not needed", "nxt_MELD_col_desp"] = "MELD/PELD 6-14"
+}
+
+df2 = data.table(df2)[, list(transitions_cnt = sum(transitions_cnt)), by = list(MELD_col_desp, nxt_MELD_col_desp)]
+df3 = pivot_wider(df2, names_from = nxt_MELD_col_desp, values_from = transitions_cnt)
+
+#df3[, 1]
+#colnames(df3)
+
+# Remove irrelevant columns:
+rem_cols = c("Deceased Donor tx, removed by transplanting center", "Transferred to another center", "Living Donor tx, removed by transplanting center", "Transplant at another center (multi-listed)", "Unable to contact candidate", "Other", "NA", "Transplanted in another country", "Candidate Removed in Error", "Deceased Donor Emergency Tx", "Refused transplant", "Patient died during TX procedure", "Medically Unsuitable")
+
+df4 = df3[, -which(names(df3) %in% rem_cols)]
+
+df4$sum_obs = rowSums(df4[, -1], na.rm = T)
+
+df42 = as.matrix(df4[, -c(1, ncol(df4))]) #?sweep
+# Divide each row by sum of each row to obtain probability:
+df42 = sweep(df42, MARGIN = 1, STATS = rowSums(df42, na.rm = T), FUN = `/`)
+df42 = as.data.frame(df42)
+df42$State = df4$MELD_col_desp
+df42 = df42[, c(ncol(df42), 1:(ncol(df42)-1))]
+df42[nrow(df42)+1, ] = c("Died", rep(0, ncol(df42)-1)); df42[nrow(df42), "Died"] = 1
+```
+
+
+```{r}
+# Remove "Inactive" state, and assign the values proportionally to other states:
+df42_mod = df42[df42$State != "Temporarily Inactive", -which(colnames(df42) == "Temporarily Inactive")]
+df42_mod[, -1] = df42_mod[, -1]  / rowSums(df42_mod[, -1]) 
+
+```
+
+# Write the file:
+```{r}
+suffix = ".csv"
+if (too_sick_for_tx_TO %in% c("MELD/PELD >34", "MELD_high")) {
+  suffix = "_v2.csv"
+}
+# "v3.csv" is prepared by using the prob. "from" 'Temporarily Inactive' to other states, and distributing the "to" 'Temporarily Inactive' probabilities to the rest of the states accordingly. 
+
+if(remove_Inactive == 1) {
+  suffix = "_no_Inactive.csv"
+  if (too_sick_for_tx_TO == "MELD/PELD >34") {
+  suffix = "_no_Inactivev2.csv"
+}
+}
+
+if (state_agg == 1){
+  # write.csv(df4, paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix//state_transition_freq_", agg_level, "_", MELD_col_name, ".csv"), row.names = F, na = "0") # This sheet is added to 'state_transition_matrix.xlsx'
+  write.csv(df42, paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/", agg_level, "/state_transition_matrix_", agg_level, "_", MELD_col_name, suffix), row.names = F, na = "0")
+  write.csv(df42_mod, paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/", agg_level, "/state_transition_matrix_", agg_level, "_", MELD_col_name, "_mod", suffix), row.names = F, na = "0")
+} else {
+  # write.csv(df4, paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/state_transition_freq_", MELD_col_name, ".csv"), row.names = F, na = "0") # This sheet is added to 'state_transition_matrix.xlsx'
+  write.csv(df42, paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/state_transition_matrix_", MELD_col_name, ".csv"), row.names = F, na = "0")
+}
+```
+
+
+
+
+
+
+
+
+
+

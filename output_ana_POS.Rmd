@@ -1,0 +1,623 @@
+
+```{r}
+library(readxl)
+library(openxlsx)
+library(maptools)
+library(foreign)
+library(dplyr)
+library(fastDummies)
+library(Matrix)
+library(pracma)
+library(SQUAREM)
+library(nleqslv)
+library(wordspace)
+
+library(data.table)
+library(ggplot2)
+library(haven)
+library(tibble)
+library(parallel)
+```
+
+# Import match data:
+```{r}
+region = c(1:11)
+
+print (paste("region: ", region))
+
+expand_on = "DSA"    # Although no sense of "TC" in this script, but let the notation be like this!
+
+agg_level = "G6AC"  # G5, G6AC
+MELD_col_name = "CANHX_STAT_CD"
+uniq_org = 48
+det_waitcost = 1
+N_after_Y_filter = 1
+rec_age_grps = 3
+
+file_suffix = paste0("_", agg_level, "_", uniq_org, "org_", ifelse(det_waitcost == 1, "det_waitcost", ""), ifelse(N_after_Y_filter == 1, "_NoN_after_Y", ""),
+                     "_", rec_age_grps, "RA")
+
+# Load the file:
+#fol = "/Users/shubham/Google Drive/SRTR/Analysis/temp_Julia/"
+fol = "C:/Users/sakshat/Google Drive/SRTR/Analysis/temp_Julia/"
+fol = "/Users/sakshat/Google Drive/SRTR/Analysis/temp_Julia/"
+match1_src = read.csv(paste0(fol, "match_Estm", file_suffix, ".csv"))
+match1 = subset(match1_src, CAN_OPO_REGION %in% region)
+
+sum(is.na(match1_src$CAN_OPO_REGION))
+```
+
+```{r}
+POS = 1
+```
+
+
+```{r}
+pat_surv = 0; org_prob_del_multi_offers = 0; approach2 = 1; trns_type = "_v3"; del_multiple_PX_ID_day_offers = 1
+
+if(approach2 == 1) {
+  org_prop_com_file_name = paste0(agg_level, "/", MELD_col_name, "/org_prob_com_", agg_level, "_", MELD_col_name, uniq_org,  ifelse(org_prob_del_multi_offers == 1, "_del_multi_offers", "_all_offers_aprch2"), ifelse(N_after_Y_filter == 1, "_NoN_after_Y", ""), ".csv")
+} else {
+  org_prop_com_file_name = paste0(agg_level, "/", MELD_col_name, "/org_prob_com_", agg_level, "_", MELD_col_name, uniq_org,  ifelse(org_prob_del_multi_offers == 1, "_del_multi_offers", "_all_offers"), ifelse(N_after_Y_filter == 1, "_NoN_after_Y", ""), ".csv")
+}
+```
+
+# Load required datasets:
+```{r}
+if (length(region) == 11) {    # therefore, all 11 regions
+  out_fol = "All_regions"
+
+  if (POS == 1) {
+    dff_com = read.csv(paste0(fol, out_fol, "/dff_COX", file_suffix, "_CHANGE_REF_POS.csv"))
+  } 
+
+  dff_com_wait_cost = read.csv(paste0(fol, out_fol, "/dff_wait_cost_COX", file_suffix, "_CHANGE_REF.csv"))
+  dff_com_wait_cost = dff_com_wait_cost[, -which(colnames(dff_com_wait_cost) %in% c("MELD_1528", "MELD_2932", "MELD_3334", "MELD_3536", "MELD_36"))]
+  # When MELD_Died == 1, everything else is 0!!!! temp = dff_com_wait_cost[dff_com_wait_cost$MELD_Died == 1, ]
+  pi_pre_com = read.csv(paste0(fol, out_fol, "/pi_pre_COX", file_suffix, ifelse(org_prob_del_multi_offers == 1, "_del_multi", "_all"),
+                               "_ofr_trns", trns_type, ifelse(approach2 == 1, "_aprch2", ""), "_All_regions.csv"))
+  pi_post_com = read.csv(paste0(fol, out_fol, "/pi_post_COX", file_suffix, ifelse(org_prob_del_multi_offers == 1, "_del_multi", "_all"), 
+                                "_ofr_trns", trns_type, ifelse(approach2 == 1, "_aprch2", ""), "_All_regions.csv"))
+  
+  st_space_pre_com = read.csv(paste0(fol, out_fol, "/st_space_pre_COX", file_suffix, ifelse(del_multiple_PX_ID_day_offers == 1, 
+  "_del_multi_offers", ""), "_All_regions.csv"))
+  st_space_post_com = read.csv(paste0(fol, out_fol, "/st_space_post_COX", file_suffix, ifelse(del_multiple_PX_ID_day_offers == 1, "_del_multi_offers", ""), "_All_regions.csv"))
+  
+}
+```
+
+# Input parameters:
+```{r}
+delta = 0.99
+
+# Estimates from the structural model::
+if (length(region) == 11) {
+  if (POS == 1) {  # "Reference level change"
+    a = c(-20.55636469, -0.993077742, -2.190880755, 20.20994314, -0.017010866)
+    w = c(0.081423992, 0.006914828, 0.007893445, 0.014926581, 0.010968469, 0.024474738)
+  }
+}
+```
+
+```{r}
+# Expected utility:
+EU_vec = function(a, df_S_it) {
+  df_S_it = df_S_it[order(df_S_it$S_it_idx), ]
+  EU_0_row_idx = which(df_S_it$org_age_type == "no_offer")
+  mat =  Matrix(as.matrix(df_S_it[, c("intercept", "sharing_type_regional", "sharing_type_national", "mean_GSi", "mean_SEQ")]), sparse = T)
+  val = mat %*% a
+  # Coerce EU = 0 for inactive, died (irrespective of organ offer (if any)) and no offer (irrespective of MELD), to get the required specification!
+  val[EU_0_row_idx] = 0
+  return (as.vector(val))
+}
+#sum(EU_vec(a, dff_com))
+
+# Waiting cost:
+wait_cost_vec = function(w, dff_wait_cost) {     # 'organ type' should NOT be part of it:
+  mat = Matrix(as.matrix(dff_wait_cost), sparse = T)     # Sparse matrix
+  val = mat %*% w
+  return (as.vector(val))
+}
+
+
+EV_vec_inmt = function(EV_vec_cand, a, w, pi, delta, df_S_it, dff_wait_cost, contrc_f) {    # Add "X_it" in the parameter
+  # Coerce EU = 0 for inactive, died (irrespective of organ offer (if any)) and no offer (irrespective of MELD), to get the required specification!
+  df_S_it = df_S_it[order(df_S_it$S_it_idx), ]
+  EU_0_row_idx = which(df_S_it$org_age_type == "no_offer")   # Instead of 'org_age_type', it can be anything that has 'no_offer' in it.
+
+  temp_df = data.frame(EU_vec_col = EU_vec(a, df_S_it),
+                       nxt_epoch_uti_col = - wait_cost_vec(w, dff_wait_cost) + delta * EV_vec_cand)
+
+  rhs = max(temp_df$EU_vec_col, temp_df$nxt_epoch_uti_col) + log(exp(temp_df$EU_vec_col - max(temp_df$EU_vec_col, temp_df$nxt_epoch_uti_col)) + 
+                                                                 exp(temp_df$nxt_epoch_uti_col - max(temp_df$EU_vec_col, temp_df$nxt_epoch_uti_col)))
+  rhs[EU_0_row_idx] = temp_df$nxt_epoch_uti_col[EU_0_row_idx]
+
+  # Since 'pi' (full transition probability matrix (MELD, q) does not depend on X_it, we can partition the 'temp_df' and calculate "val" separately for each X_it)
+  val = c(); contrc_f_val = c()
+  if (det_waitcost == 1) {
+    df_S_it$rec_type = paste(df_S_it$rec_age_type, df_S_it$rec_life_sup, df_S_it$rec_med_cond, sep = "|")
+  } else {df_S_it$rec_type = df_S_it$rec_age_type}
+
+  for (X_it in unique(df_S_it[, "rec_type"])) {     # rec_age_travel_time, X_it + travel_time_it won't take more than 10 values I guess, so 'for' loop is fine!
+    idx_range = which(df_S_it[, "rec_type"] == X_it)
+    val_ = EV_vec_cand[idx_range] - pi %*% rhs[idx_range]    # val = EV_vec_cand - pi %*% rhs
+    #print (as.vector(val_))
+    val = c(val, as.vector(val_))
+    contrc_f_val = c(contrc_f_val, as.vector(pi %*% rhs[idx_range]))
+  }
+  if (contrc_f == 1) {return (contrc_f_val)}
+  return (as.vector(val))
+}
+
+# Sys.time()
+# EV_vec0 = squarem(fixptfn = EV_vec_inmt, par = EV_vec_, control = list(maxiter = 5000, tol = 1e-9),    # rep(1, nrow(dff_com1))
+#                   a = a, w = w, pi = pi_, delta = delta, df_S_it = dff_com[, ], dff_wait_cost = dff_com_wait_cost, contrc_f = 1)
+# EV_vec0
+# Sys.time()
+```
+
+# Contraction mapping to estimate EV_vec, DSA-wise:
+```{r}
+if (length(region) == 11) {
+  dsa_list = c("ALOB", 	"AROR", 	"AZOB", 	"CADN", 	"CAOP", 	"CASD", 	"CORS", 	"CTOP", 	"DCTC", 	"FLFH", 	"FLMP", 	"FLUF", 	"FLWC", 	"GALL", 	"HIOP", 	"IAOP", 	"ILIP", 	"INOP", 	"KYDA", 	"LAOP", 	"MAOB", 	"MDPC", 	"MIOP", 	"MNOP", 	"MOMA", 	"MSOP", 	"MWOB", 	"NCCM", 	"NCNC", 	"NEOR", 	"NJTO", 	"NYFL", 	"NYRT", 	"OHLB", 	"OHLP", 	"OHOV", 	"OKOP", 	"ORUO", 	"PADV", 	"PATF", 	"PRLL", 	"SCOP", 	"TNDS", 	"TNMS", 	"TXGC", 	"TXSA", 	"TXSB", 	"UTOP", 	"VATB", 	"WALC", 	"WIDN", 	"WIUW")
+}
+
+k=0
+for (dsa_ in dsa_list) {
+  k = k + 1
+  if (length(region) == 11) {
+    dff_pre = dff_com[(dff_com$DSA == dsa_) & (dff_com$policy == "pre"), -which(colnames(dff_com) %in% c("policy"))]; dff_pre = dff_pre[order(dff_pre$S_it_idx), ]
+    dff_post = dff_com[(dff_com$DSA == dsa_) & (dff_com$policy == "post"), -which(colnames(dff_com) %in% c("policy"))]; dff_post = dff_post[order(dff_post$S_it_idx), ]
+    dff_wait_cost_ = dff_com_wait_cost
+  }
+
+  pi_pre_ = pi_pre_com[pi_pre_com$DSA == dsa_, -which(colnames(pi_pre_com) == "DSA")]
+  pi_post_ = pi_post_com[pi_post_com$DSA == dsa_, -which(colnames(pi_post_com) == "DSA")]
+   
+  EV_vec_pre_ = data.frame(dff_pre[, c(1:10)], EV_vec_pre_val = squarem(fixptfn = EV_vec_inmt, par = runif(nrow(dff_pre), min = 1, max = 3), control = list(maxiter = 10000, tol = 1e-13), a=a, w=w, pi = as.matrix(pi_pre_), delta = delta, df_S_it = dff_pre[, ], dff_wait_cost = dff_wait_cost_, contrc_f = 1)$par)
+  EV_vec_pre_$EU = EU_vec(a, dff_pre[, ]); EV_vec_pre_$EW = wait_cost_vec(w, dff_wait_cost_)
+  
+  EV_vec_post_ = data.frame(dff_post[, c(1:10)], EV_vec_post_val = squarem(fixptfn = EV_vec_inmt, par = runif(nrow(dff_post), min = 1, max = 3), control = list(maxiter = 10000, tol = 1e-13), a=a, w=w, pi = as.matrix(pi_post_), delta = delta, df_S_it = dff_post[, ], dff_wait_cost = dff_wait_cost_, contrc_f = 1)$par)
+  EV_vec_post_$EU = EU_vec(a, dff_post[, ]); EV_vec_post_$EW = wait_cost_vec(w, dff_wait_cost_)
+  
+  if (k == 1) {
+    EV_vec_pre_final = EV_vec_pre_
+    EV_vec_post_final = EV_vec_post_
+  } else {
+    EV_vec_pre_final = rbind(EV_vec_pre_final, EV_vec_pre_)
+    EV_vec_post_final = rbind(EV_vec_post_final, EV_vec_post_)
+  }
+}
+max(abs(EV_vec_inmt(EV_vec_post_$EV_vec_post_val, a, w, pi = as.matrix(pi_post_), delta, df_S_it = dff_post[, ], dff_wait_cost = dff_wait_cost_, contrc_f = 0)))
+#EV_vec_inmt(runif(nrow(dff_pre), min = -3, max = -1), a, w, pi = as.matrix(pi_post_), delta, df_S_it = dff_post[, ], dff_wait_cost = dff_wait_cost_, contrc_f = 1)
+
+#write.csv(EV_vec_pre_final[EV_vec_pre_final$DSA == "DCTC", ], "/Users/sakshat/Desktop/EV_vec_pre_final_R.csv", row.names = F)
+#write.csv(EV_vec_post_final[EV_vec_post_final$DSA == "DCTC", ], "/Users/sakshat/Desktop/EV_vec_post_final_R.csv", row.names = F)
+```
+
+```{r}
+VVVVIIII:
+# Cross-check values in EV_vec_pre_final with that of obtained in Julia: HAVE CHECKED....the answers MATCH!!
+```
+
+```{r}
+names(EV_vec_pre_final); unique(EV_vec_pre_final$MELD)
+if (agg_level == "G5") {
+  EV_vec_pre_final$MELD = factor(EV_vec_pre_final$MELD, levels = c("Died", "MELD/PELD 6-14", "MELD/PELD 15-24", "MELD/PELD   25-29", "MELD/PELD 30-34", "MELD/PELD >34"))
+  EV_vec_post_final$MELD = factor(EV_vec_post_final$MELD, levels = c("Died", "MELD/PELD 6-14", "MELD/PELD 15-24", "MELD/PELD 25-29", "MELD/PELD 30-34", "MELD/PELD >34"))
+} else if (agg_level == "G6AC") {
+  EV_vec_pre_final$MELD = factor(EV_vec_pre_final$MELD, levels = c("Died", "MELD/PELD 6-14", "MELD/PELD 15-28", "MELD/PELD 29-32", "MELD/PELD 33-34", "MELD/PELD 35-36", "MELD/PELD >36"))
+  EV_vec_post_final$MELD = factor(EV_vec_post_final$MELD, levels = c("Died", "MELD/PELD 6-14", "MELD/PELD 15-28", "MELD/PELD 29-32", "MELD/PELD 33-34", "MELD/PELD 35-36", "MELD/PELD >36"))
+}
+
+m = lm(EV_vec_pre_val ~ MELD , data = EV_vec_pre_final); summary(m)
+m = lm(EV_vec_post_val ~ MELD , data = EV_vec_post_final); summary(m)
+
+pre_post_change =  EV_vec_pre_final; pre_post_change$EV_vec_post_val = EV_vec_post_final$EV_vec_post_val
+pre_post_change$delta_EV_vec_val = pre_post_change$EV_vec_post_val - pre_post_change$EV_vec_pre_val
+# min(EV_vec_pre_final$EU-EV_vec_post_final$EU); max(EV_vec_pre_final$EW-EV_vec_post_final$EW)
+
+pre_post_change$delta_p_acpt = exp(pre_post_change$EU) / (exp(pre_post_change$EU) + exp(-pre_post_change$EW + delta * pre_post_change$EV_vec_post_val)) - 
+                               exp(pre_post_change$EU) / (exp(pre_post_change$EU) + exp(-pre_post_change$EW + delta * pre_post_change$EV_vec_pre_val))
+col_names = colnames(pre_post_change)
+
+m = lm(delta_EV_vec_val ~ MELD , data = pre_post_change); summary(m)
+```
+
+# Adding weights (wt) to the 'pre_post_change':
+```{r}
+## Organ offer probability:
+org_p_src = read.csv(paste0(substr(fol, 1, nchar(fol) - 11), "Transition_matrix/", org_prop_com_file_name))   # IMP: CAN CHANGE DEPENDING ON THE ORGAN CATEGORIZATION:(org_arrival.Rmd)
+org_p = subset(org_p_src, CAN_OPO_REGION %in% region)
+
+## Combine the 'pre' and 'post' organ probabilities (tot_offers/tot_wait_time):
+# Add 'tot_offers' or days with no offer for "no_offer" types:
+sum(is.na(org_p$tot_offers))
+org_p[is.na(org_p$tot_offers), "tot_offers"] = org_p[is.na(org_p$tot_offers), "tot_wait_time"] * org_p[is.na(org_p$tot_offers), "org_prob"]
+sum(org_p$org_prob)
+
+# Combining pre-  and post- :
+org_p = data.table(org_p)[, list(org_prob_pre_post = sum(tot_offers) / sum(tot_wait_time)), by = list(CAN_OPO_CD, PTR_STAT_CD_desp, type)] # , age_type, race_type, cod_type, dcd_type
+sum(org_p$org_prob_pre_post)   # Should be 5(MELD) *5(DSA) # * 2(policy)
+
+# Need to normalize the probabilities (becoz of multiple offers in a day):
+org_p = data.table(org_p)[, org_prob_norm := org_prob_pre_post / sum(org_prob_pre_post), by = list(CAN_OPO_CD, PTR_STAT_CD_desp)]
+sum(org_p$org_prob_norm)
+colnames(org_p)[which(colnames(org_p) == "PTR_STAT_CD_desp")] = "new_PTR_STAT_CD_desp"
+
+pre_post_change$org_type = paste(pre_post_change$org_age_type, pre_post_change$org_race_type, pre_post_change$org_cod_type, pre_post_change$org_dcd_type, sep = "_")
+pre_post_change[pre_post_change$org_type == "no_offer_no_offer_no_offer_no_offer", "org_type"] = "no_offer"
+pre_post_change$rec_type = paste(pre_post_change$rec_age_type, pre_post_change$rec_life_sup, pre_post_change$rec_med_cond, sep = "_")
+
+# Merge:
+pre_post_change = merge(pre_post_change, org_p[, -c("org_prob_pre_post")], by.x = c("MELD", "DSA", "org_type"), by.y = c("new_PTR_STAT_CD_desp", "CAN_OPO_CD", "type"), all.x = T)
+pre_post_change[is.na(pre_post_change$org_prob_norm), "org_prob_norm"] = 0   # Since these 'organ_types' were not observed in the data!
+# Note that sum of probabilities for (sharing_type=local/regional/national + "no_offer", MELD, DSA, rec_type) = 1
+
+## Sharing_type:
+shar_p_com = data.table(match1)[, list(local = sum(sharing == "local")/.N, regional = sum(sharing == "regional")/.N, national = sum(sharing == "national")/.N), 
+                                              by = list(CAN_OPO_CD, new_PTR_STAT_CD_desp, type)]; print (unique(shar_p_com$CAN_OPO_CD))
+shar_p_com = melt(shar_p_com, id = c("CAN_OPO_CD", "new_PTR_STAT_CD_desp", "type"))
+colnames(shar_p_com)[(ncol(shar_p_com) - 1) : ncol(shar_p_com)] = c("sharing_type", "shar_p")
+# shar_p_com = as.data.frame(dcast(shar_p_com, CAN_OPO_CD + new_PTR_STAT_CD_desp + type + sharing_type ~ policy, value.var = "shar_p")); shar_p_com[is.na(shar_p_com)] = 1/3
+# colnames(shar_p_com)[which(colnames(shar_p_com) == "pre")] = "shar_p_pre"; colnames(shar_p_com)[which(colnames(shar_p_com) == "post")] = "shar_p_post"
+
+# Merge:
+pre_post_change = merge(pre_post_change, shar_p_com, by.x = c("MELD", "DSA", "org_type", "sharing_type"), by.y = c("new_PTR_STAT_CD_desp", "CAN_OPO_CD", "type", "sharing_type"), all.x = T)
+sum(is.na(pre_post_change$shar_p)) # Because these (DSA, MELD, type) although present in "org_p", but were not there in 'match1' (since multiple offers had been removed)
+# temp = subset(match1, (type == "A4_Other_Other_Yes") & (CAN_OPO_CD == "MDPC") & (new_PTR_STAT_CD_desp == "MELD/PELD >34"))
+# temp = subset(match1, (type == "A5_White_CVA_Yes") & (CAN_OPO_CD == "AZOB") & (new_PTR_STAT_CD_desp == "MELD/PELD 15-24"))
+
+table(pre_post_change[is.na(pre_post_change$shar_p), "sharing_type"])  # Equal numbers for local/regional/national
+# Fill 'NA' with 1/3 wherever there's an organ, otherwise 0:
+pre_post_change[pre_post_change$sharing_type == "no_offer", "shar_p"] = 0; pre_post_change[is.na(pre_post_change$shar_p), "shar_p"] = 1/3
+
+## Rec_type:
+match1_ = unique(match1[, c("PX_ID", "CAN_OPO_REGION", "CAN_OPO_CD", "rec_age_type", "rec_life_sup", "rec_med_cond")])
+match1_$rec_type = paste(match1_$rec_age_type, match1_$rec_life_sup, match1_$rec_med_cond, sep = "_")
+  
+rec_p_com = setDT(match1_)[, .(Freq = .N), by = .(CAN_OPO_CD, rec_type)]
+rec_p_com = data.table(rec_p_com)[, total := sum(Freq), by = list(CAN_OPO_CD)]; rec_p_com$rec_p = rec_p_com$Freq/rec_p_com$total
+# rec_p_com = as.data.frame(dcast(rec_p_com, CAN_OPO_CD + rec_type ~ policy, value.var = "rec_p")); rec_p_com[is.na(rec_p_com)] = 0
+# colnames(rec_p_com)[which(colnames(rec_p_com) == "pre")] = "rec_p_pre"; colnames(rec_p_com)[which(colnames(rec_p_com) == "post")] = "rec_p_post"
+
+# Merge:
+pre_post_change = merge(pre_post_change, as.data.frame(rec_p_com)[, c("CAN_OPO_CD", "rec_type", "rec_p")], by.x = c("DSA", "rec_type"), by.y = c("CAN_OPO_CD", "rec_type"), all.x = T)
+sum(is.na(pre_post_change$rec_p)); pre_post_change[is.na(pre_post_change$rec_p), "rec_p"] = 0
+
+# summary(pre_post_change)
+
+pre_post_change$wt = pre_post_change$org_prob_norm * pre_post_change$shar_p * pre_post_change$rec_p
+
+sum(pre_post_change$wt)
+sum(pre_post_change$org_prob_norm)   # Sum of 'org_p_norm' for (DSA, MELD, rec_type, sharing_type) <1. But, (DSA, MELD, rec_type, sharing_type=local/reg/nat + no_offer) = 1! "No offers" has 'no_offer' as sharing_type 
+sum(pre_post_change$shar_p)
+sum(pre_post_change$rec_p)
+
+# Normalize the 'wt' (DSA, MELD) wise:
+pre_post_change = as.data.frame(data.table(pre_post_change)[, wt_norm := wt / sum(wt), by = list(DSA, MELD)])
+sum(is.nan(pre_post_change$wt_norm)); pre_post_change[is.nan(pre_post_change$wt_norm), "wt_norm"] = 0    # 0/0 is NaN
+sum(pre_post_change$wt); sum(pre_post_change$wt_norm)
+
+pre_post_change = pre_post_change[, c(col_names, "wt_norm")]
+
+# Add Region:
+pre_post_change = merge(pre_post_change, unique(org_p_src[, c("CAN_OPO_CD", "CAN_OPO_REGION")]), by.x = "DSA", by.y = "CAN_OPO_CD", all.x = T)
+colnames(pre_post_change)[which(colnames(pre_post_change) == "CAN_OPO_REGION")] = "Region"
+```
+
+# Write the files:
+```{r}
+# names(pre_post_change)
+# temp1 = data.table(pre_post_change)[, list(cnt = .N, mean_change_p_acpt = mean(delta_p_acpt)), by = list(MELD, DSA)]
+
+if (agg_level == "G5") {
+  pre_post_change$MELD = factor(pre_post_change$MELD, levels = c("MELD/PELD 6-14", "MELD/PELD 15-24", "MELD/PELD 25-29", "MELD/PELD 30-34", "MELD/PELD >34", "Died"))
+} else if (agg_level == "G6AC") {
+  pre_post_change$MELD = factor(pre_post_change$MELD, levels = c("MELD/PELD 6-14", "MELD/PELD 15-28", "MELD/PELD 29-32", "MELD/PELD 33-34", "MELD/PELD 35-36", "MELD/PELD >36", "Died"))
+}
+
+# At the level of DSAs:
+temp = data.table(pre_post_change)[, list(cnt = .N, change_p_acpt = weighted.mean(x=delta_p_acpt, w=wt_norm)), by = list(MELD, Region, DSA)]
+temp[is.nan(temp$change_p_acpt), "change_p_acpt"] = 0
+
+temp1 = as.data.frame(dcast(temp, MELD ~ DSA + Region, value.var = "change_p_acpt"))
+
+# At the level of Regions: NOT sure about the correct way to calculate, becoz, DSAs (in a region) need to be weighed!!!
+
+# Write the files:
+
+write.csv(pre_post_change, paste0(fol, "All_regions/Results/", "pre_post_change_All_Regions_POS.csv"), row.names = F)
+write.xlsx(temp1, paste0(fol, "All_regions/Results/", "change_p_acpt_All_Regions_POS.xlsx"), row.names = F)
+```
+
+# 'wt_norm' modified: (NEED TO CROSS-CHECK!!)
+```{r}
+THIS IS INCORRECT: SImPLY TAKING AVERAGE OVER THE DSAs, NOT WEIGHING THEM!!
+  
+pre_post_change = read.csv(paste0(fol, "All_regions/Results/", "pre_post_change_All_Regions.csv"))
+
+pre_post_change = as.data.frame(data.table(pre_post_change)[, wt_norm_v2 := wt_norm / sum(wt_norm), by = list(Region, MELD)])
+sum(is.nan(pre_post_change$wt_norm_v2)); 
+unique(pre_post_change[is.nan(pre_post_change$wt_norm_v2), "MELD"])
+
+# At the level of Regions:
+temp = data.table(pre_post_change)[, list(cnt = .N, change_p_acpt = weighted.mean(x=delta_p_acpt, w=wt_norm_v2)), by = list(MELD, Region)]
+# temp[is.nan(temp$change_p_acpt), "change_p_acpt"] = 0
+
+temp1 = as.data.frame(dcast(temp, MELD ~ Region, value.var = "change_p_acpt"))
+
+write.xlsx(temp1, paste0(fol, "All_regions/Results/", "change_p_acpt_All_Regions_v2.xlsx"), row.names = F)
+
+#
+temp = data.table(match1)[, list(cnt = .N), by = list(CAN_OPO_CD, CAN_OPO_REGION)]
+temp = as.data.frame(data.table(temp)[, wt := cnt / sum(cnt), by = list(CAN_OPO_REGION)])
+write.csv(temp, paste0(fol, "All_regions/Results/", "temp.csv"), row.names = F)
+
+temp = data.table(match1)[, list(supply = uniqueN(DONOR_ID), demand = uniqueN(PX_ID)), by = list(CAN_OPO_REGION, policy)]
+
+
+```
+
+
+# Summary (statistics) of change in offers accepted by MELD:
+```{r}
+temp = data.table(match1)[, list(p_simple = sum(PTR_OFFER_ACPT == "Y")/.N), by = list(new_PTR_STAT_CD_desp, policy, CAN_OPO_CD, CAN_OPO_REGION)]
+# Subtract "post-pre":
+f = function(policy, p_simple) {
+  temp = data.frame(v1 = policy, v2 = p_simple)
+  return (temp[temp$v1 == "post", "v2"] - temp[temp$v1 == "pre", "v2"])
+}
+change = data.table(temp)[, list(change_p_simple = f(policy, p_simple)), by = list(new_PTR_STAT_CD_desp, CAN_OPO_CD, CAN_OPO_REGION)]
+
+temp1 = as.data.frame(dcast(change, new_PTR_STAT_CD_desp ~ CAN_OPO_CD + CAN_OPO_REGION, value.var = "change_p_simple"))
+
+# Write the files:
+if (length(region) == 11) {
+  write.csv(temp1, paste0(fol, "All_regions/Results/", "change_p_simple_All_Regions.csv"), row.names = F)
+} else {
+  write.csv(temp1, paste0(fol, ref_OPO, "/", agg_level, "_final_com/", "change_p_simple_Region", region, ".csv"), row.names = F)
+}
+# Reduced form regression:
+unique(match1$PTR_OFFER_ACPT)
+match1$y_val = 0; match1[match1$PTR_OFFER_ACPT == "Y", "y_val"] = 1
+m = glm(y_val ~ new_PTR_STAT_CD_desp + rec_age_type + rec_life_sup + rec_med_cond + policy + type, data = match1, family = "binomial")
+summary(m)
+```
+
+
+# MELD Distribution of patients: See "pat_MELD_distb_2010_18.xlsx"
+# Summary statistics:
+```{r}
+# Expected Utility if offer was accepted!
+# a = c(-23.7433,
+# -1.74761,
+# -3.04299,
+# 22.3258,
+# 0.180172,
+# -0.298965,
+# -1.53348,
+# -1.5032)
+temp = read.csv(paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/temp_Julia/mean_GSi", file_suffix, ".csv"))
+match1 = merge(match1, temp, all.x = T)    # Add the column "mean_GSi" to match1, because it will be used in Utility calculation!
+
+match1$pros_uti = a[1] + (match1$sharing == "regional") * a[2] + (match1$sharing == "national") * a[3] + match1$mean_GSi * a[4] +
+                                                (match1$CAN_OPO_CD == "MDPC") * a[5] + (match1$CAN_OPO_CD == "NJTO") * a[6] +
+                                                (match1$CAN_OPO_CD == "PADV") * a[7] + (match1$CAN_OPO_CD == "PATF") * a[8]
+summary(match1$pros_uti)
+  
+
+# Offer acceptance rate:
+unique(match1$new_PTR_STAT_CD_desp)
+unique(match1$sharing)
+# temp1 = data.table(match1)[, list(cnt_ofrs = .N, change_ofr_acpt_prob = sum(PTR_OFFER_ACPT == "Y")/.N, local_prop = sum(sharing == "local")/.N), by = list(CAN_OPO_CD, new_PTR_STAT_CD_desp, policy)]
+
+f = function(pros_uti, policy) {
+  temp = data.frame(col1 = pros_uti, col2 = policy)
+  val = mean(temp[temp$col2 == "post", ]$col1) - mean(temp[temp$col2 == "pre", ]$col1)
+  return (val)
+}
+temp1 = data.table(match1)[, list(cnt_tot_ofrs = .N, change_mean_pros_uti = f(pros_uti, policy)), by = list(CAN_OPO_CD, new_PTR_STAT_CD_desp)]
+
+# Write the files:
+write.csv(temp1, "/Volumes/GoogleDrive/My Drive/SRTR/INFORMS/temp1.csv", row.names = F)
+```
+
+# How to explain the variation in 'behavior change' between MELD groups and DSAs?
+
+# Change in Demand related factors: 
+## "Initial WL" (DSA, MELD wise change at the start of the two policies):
+```{r}
+df = read.csv("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/stathist_liin_v2.csv")
+
+# Aggregate the states:
+ref = read_excel("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/ptr_li_sample.xlsx", sheet = paste0("transition_agg_", agg_level))
+df = merge(df, ref, by = c("CANHX_STAT_CD", "CANHX_STAT_CD_desp"), all.x = T)
+df = df[, -which(names(df) %in% c("CANHX_STAT_CD", "CANHX_STAT_CD_desp"))]
+
+# Rename the column back to original:
+names(df)[which(names(df) %in% c("new_CANHX_STAT_CD"))] = "CANHX_STAT_CD"
+names(df)[which(names(df) %in% c("new_CANHX_STAT_CD_desp"))] = "CANHX_STAT_CD_desp"
+
+df$CANHX_STAT_CD = as.character(df$CANHX_STAT_CD)
+unique(df$CANHX_STAT_CD_desp)
+
+if (agg_level == "G5") {
+  rel_MELD_cat = c("MELD/PELD 6-14", "MELD/PELD 15-24", "MELD/PELD 25-29", "MELD/PELD 30-34", "MELD/PELD >34")
+  col_lst = c("DSA", "MELD/PELD 6-14", "MELD/PELD 15-24", "MELD/PELD 25-29", "MELD/PELD 30-34", "MELD/PELD >34")
+} else if (agg_level == "G6AC") {
+  rel_MELD_cat = c("MELD/PELD 6-14", "MELD/PELD 15-28", "MELD/PELD 29-32", "MELD/PELD 33-34", "MELD/PELD 35-36", "MELD/PELD >36")
+  col_lst = c("DSA", "MELD/PELD 6-14", "MELD/PELD 15-28", "MELD/PELD 29-32", "MELD/PELD 33-34", "MELD/PELD 35-36", "MELD/PELD >36")
+}
+df = df[df$CANHX_STAT_CD_desp %in% rel_MELD_cat, ]
+
+df$CANHX_BEGIN_DT = as.Date(df$CANHX_BEGIN_DT, "%Y-%m-%d")
+df$CANHX_END_DT = as.Date(df$CANHX_END_DT, "%Y-%m-%d")
+
+date_lst = c(as.Date("2010-01-01", "%Y-%m-%d"), as.Date("2013-06-15", "%Y-%m-%d"))
+
+wl = read.csv("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/waitlist.csv")
+# Vlookup CANDIDATE's information using PX_ID:
+wl1 = wl[, c("PX_ID", "CAN_AGE_IN_MONTHS_AT_LISTING", "CAN_OPO_CD", "CAN_OPO_REGION", "CAN_CTR_CD")]
+df1 = merge(df, wl1, by = "PX_ID", all.x = T)
+df1 = df1[!is.na(df1$CAN_OPO_CD), ]
+df1 = df1[df1$CAN_OPO_REGION %in% region, ]
+
+# Retain only patients who were on the WL on particular dates:   min(df1$CANHX_BEGIN_DT); max(df1$CANHX_BEGIN_DT)
+cond1 = (df1$CANHX_BEGIN_DT < date_lst[1]) & (df1$CANHX_END_DT > date_lst[1])
+cond2 = (df1$CANHX_BEGIN_DT < date_lst[2]) & (df1$CANHX_END_DT > date_lst[2])
+
+df1$cond = ifelse(cond1, as.character(date_lst[1]), ifelse(cond2, as.character(date_lst[2]), "remove"))
+table(df1$cond)
+
+temp  = setDT(df1[df1$cond != "remove", ])[, .(Freq = .N), by = .(CAN_OPO_CD, CANHX_STAT_CD_desp, cond)]    # table(df1$CANHX_STAT_CD_desp)
+temp1 = as.data.frame(dcast(temp, CAN_OPO_CD + cond ~ CANHX_STAT_CD_desp, value.var = "Freq")); temp1[is.na(temp1)] = 0
+temp1 = temp1[!is.na(temp1$CAN_OPO_CD), -which(colnames(temp1) == "NA")]
+# temp = data.table(df1[df1$cond != 0, ])[, list(cnt = .N, MELD_6_14 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[1])/.N, MELD_15_24 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[2])/.N, 
+#                                   MELD_25_29 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[3])/.N, MELD_30_34 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[4])/.N,
+#                                   MELD_35_ = sum(CANHX_STAT_CD_desp == rel_MELD_cat[5])/.N
+#                                   ), by = list(CAN_OPO_CD, cond)]
+
+if (agg_level == "G5") {
+  n_col_chng = 7
+} else if (agg_level == "G6AC") {
+  n_col_chng = 8
+}
+
+temp1 = temp1[order(temp1$CAN_OPO_CD), ]
+change = cbind(temp1[temp1$cond == date_lst[1], ]$CAN_OPO_CD, temp1[temp1$cond == date_lst[2], c(3:n_col_chng)] - temp1[temp1$cond == date_lst[1], c(3:n_col_chng)])
+colnames(change)[1] = "DSA"
+change = change[, col_lst]; change = t(change)
+```
+
+# Write the files:
+```{r}
+temp=t(temp1)
+
+write.csv(temp1, "/Users/sakshat/Desktop/temp.csv", row.names = T)
+```
+
+
+## "New patients" (DSA, MELD wise change during two policies time periods):
+```{r}
+# 'wl' has one record per patient: 
+names(wl)
+wl$CAN_ACTIVATE_DT = as.Date(wl$CAN_ACTIVATE_DT, "%Y-%m-%d")
+wl$CAN_LISTING_DT = as.Date(wl$CAN_LISTING_DT, "%Y-%m-%d")
+
+cond1 = (wl$CAN_ACTIVATE_DT >= as.Date("2010-01-01", "%Y-%m-%d")) & (wl$CAN_ACTIVATE_DT < as.Date("2013-06-15", "%Y-%m-%d"))
+cond2 = (wl$CAN_ACTIVATE_DT >= as.Date("2013-06-15", "%Y-%m-%d")) & (wl$CAN_ACTIVATE_DT < as.Date("2016-11-30", "%Y-%m-%d"))
+cond11 = (wl$CAN_LISTING_DT >= as.Date("2010-01-01", "%Y-%m-%d")) & (wl$CAN_LISTING_DT < as.Date("2013-06-15", "%Y-%m-%d"))
+cond22 = (wl$CAN_LISTING_DT >= as.Date("2013-06-15", "%Y-%m-%d")) & (wl$CAN_LISTING_DT < as.Date("2016-11-30", "%Y-%m-%d"))
+sum(cond1); sum(cond2); sum(cond11); sum(cond22)   # Not much differnece b/w the two sets of conditions.
+# as.Date("2013-06-15", "%Y-%m-%d") - as.Date("2010-01-01", "%Y-%m-%d"); as.Date("2016-11-30", "%Y-%m-%d") - as.Date("2013-06-15", "%Y-%m-%d")
+
+wl$cond = ifelse(cond11, "pre", ifelse(cond22, "post", "remove")); table(wl$cond)
+
+new_pat = data.table(wl[(wl$cond != "remove") & (wl$CAN_OPO_REGION %in% region), ])[, list(new_pat_cnt = .N, new_pat_age = mean(CAN_AGE_AT_LISTING)), by = list(CAN_OPO_CD, cond)]
+temp1 = as.data.frame(dcast(new_pat, cond ~ CAN_OPO_CD, value.var = "new_pat_age"))   # new_pat_age, new_pat_cnt
+
+# Avg. age of the patients when joining the queue:
+```
+
+# Change in Supply related factors: 
+## "Organ arrivals" (DSA wise change during two policies time periods):
+```{r}
+don = read.csv("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/donor.csv")
+don$date <- as.Date(don$date, format= "%Y-%m-%d"); min(don$date); max(don$date)
+
+don = don[don$DON_AGE >= 18, ]
+
+cond1 = (don$date >= as.Date("2010-01-01", "%Y-%m-%d")) & (don$date < as.Date("2013-06-15", "%Y-%m-%d"))
+cond2 = (don$date >= as.Date("2013-06-15", "%Y-%m-%d")) & (don$date < as.Date("2016-11-30", "%Y-%m-%d"))
+sum(cond1); sum(cond2)
+
+don$cond = ifelse(cond1, "pre", ifelse(cond2, "post", "remove")); table(don$cond)
+org_arr = data.table(don[(don$cond != "remove") & (don$DON_OPO_REGION %in% region), ])[, list(org_arr_cnt = .N), by = list(DON_OPO_CTR_CD, cond)]
+temp1 = as.data.frame(dcast(org_arr, cond ~ DON_OPO_CTR_CD, value.var = "org_arr_cnt"))   # new_pat_age, new_pat_cnt
+
+# Number of offers:
+match1$date = as.Date(match1$date, "%Y-%m-%d"); min(match1$date); max(match1$date)
+cond1 = (match1$date >= as.Date("2010-01-01", "%Y-%m-%d")) & (match1$date < as.Date("2013-06-15", "%Y-%m-%d"))
+cond2 = (match1$date >= as.Date("2013-06-15", "%Y-%m-%d")) & (match1$date < as.Date("2016-11-30", "%Y-%m-%d"))
+
+match1$cond = ifelse(cond1, "pre", ifelse(cond2, "post", "remove"))
+table(match1$cond)
+
+temp  = setDT(match1[match1$cond != "remove", ])[, .(ofr_cnt = .N), by = .(CAN_OPO_CD, new_PTR_STAT_CD_desp, cond)]    # table(match1$new_PTR_STAT_CD_desp)
+temp1 = as.data.frame(dcast(temp, CAN_OPO_CD + cond ~ new_PTR_STAT_CD_desp, value.var = "ofr_cnt"))
+
+temp1 = temp1[order(temp1$CAN_OPO_CD), ]
+change = cbind(temp1[temp1$cond == "pre", ]$CAN_OPO_CD, temp1[temp1$cond == "post", c(3:n_col_chng)] - temp1[temp1$cond == "pre", c(3:n_col_chng)])
+colnames(change)[1] = "DSA"
+change = change[, col_lst]; change = t(change)
+temp=t(temp1)
+#write.csv(change, "/Users/sakshat/Desktop/temp.csv", row.names = T)
+```
+
+# Number of patients:
+```{r}
+temp  = setDT(match1[match1$cond != "remove", ])[, .(pat_cnt = uniqueN(PX_ID)), by = .(CAN_OPO_CD, new_PTR_STAT_CD_desp, cond)]    # table(match1$new_PTR_STAT_CD_desp)
+temp1 = as.data.frame(dcast(temp, CAN_OPO_CD + cond ~ new_PTR_STAT_CD_desp, value.var = "pat_cnt"))
+
+temp1 = temp1[order(temp1$CAN_OPO_CD), ]
+change = cbind(temp1[temp1$cond == "pre", ]$CAN_OPO_CD, temp1[temp1$cond == "post", c(3:n_col_chng)] - temp1[temp1$cond == "pre", c(3:n_col_chng)])
+colnames(change)[1] = "DSA"
+change = change[, col_lst]; change = t(change)
+temp=t(temp1)
+#write.csv(change, "/Users/sakshat/Desktop/temp.csv", row.names = T)
+```
+
+
+# Number of 'local/regional' offers:
+```{r}
+# Number of 'local' offers:
+table(match1$cond)
+
+temp  = setDT(match1[match1$cond != "remove", ])[, .(local_ofr_cnt = sum(sharing == "local"), regional_ofr_cnt = sum(sharing == "regional")), by = .(CAN_OPO_CD, new_PTR_STAT_CD_desp, cond)]    # table(match1$new_PTR_STAT_CD_desp)
+temp1 = as.data.frame(dcast(temp, CAN_OPO_CD + cond ~ new_PTR_STAT_CD_desp, value.var = "local_ofr_cnt"))
+temp2 = as.data.frame(dcast(temp, CAN_OPO_CD + cond ~ new_PTR_STAT_CD_desp, value.var = "regional_ofr_cnt"))
+
+temp1 = temp1[order(temp1$CAN_OPO_CD), ]; temp2 = temp2[order(temp2$CAN_OPO_CD), ]
+change = cbind(temp1[temp1$cond == "pre", ]$CAN_OPO_CD, temp1[temp1$cond == "post", c(3:n_col_chng)] - temp1[temp1$cond == "pre", c(3:n_col_chng)])
+change = cbind(temp2[temp2$cond == "pre", ]$CAN_OPO_CD, temp2[temp2$cond == "post", c(3:n_col_chng)] - temp2[temp2$cond == "pre", c(3:n_col_chng)])
+colnames(change)[1] = "DSA"
+change = change[, col_lst]; change = t(change)
+temp=t(temp1)
+write.csv(temp2, "/Users/sakshat/Desktop/temp.csv", row.names = T)
+```
+
+
+```{r}
+
+```
+
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+
+
+
+
+
+
+
+

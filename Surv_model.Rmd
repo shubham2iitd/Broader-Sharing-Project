@@ -1,0 +1,293 @@
+
+```{r}
+library(data.table)
+library(readxl)
+library(openxlsx)
+library(ggplot2)
+library(maptools)
+library(foreign)
+library(plyr)
+library(haven)
+library(survival)
+
+print ("_-")
+```
+
+```{r}
+computer = "imac" # mac, imac, windows
+
+if (computer == "imac") {
+  fol_ = "/Users/sakshat/Google Drive/SRTR"
+} else if (computer == "mac") {
+  fol_ = "/Users/shubham/Google Drive/SRTR"
+} else if (computer == "windows") {
+  fol_ = "C:/Users/sakshat/Google Drive/SRTR"
+}
+```
+
+```{r}
+state_agg = 1
+agg_level = "G6AC"
+sheet_MELD_class = paste0("transition_agg_", agg_level) # "transition_agg_G11" # "transition_agg_SIMPLE"
+
+MELD_col_name = "CANHX_STAT_CD" # "CANHX_OPTN_LAB_MELD" # "CANHX_STAT_CD" # "CANHX_SRTR_LAB_MELD  # Columns to indicate the MELD during the WL period
+MELD_col_desp_name = paste0(MELD_col_name, "_desp")
+```
+
+# Read the files:
+```{r}
+df = read.csv(paste0(fol_, "/Analysis/Transition_matrix/", agg_level, "/", MELD_col_name,  "/stathist_liin_nxt_state_time_adj_", agg_level, "_", MELD_col_name, ".csv"))
+```
+
+# Import Candidates' age info:
+```{r}
+wl = read.csv(paste0(fol_, "/From SRTR/pubsaf1903/cand_liin.csv"), stringsAsFactors = F)
+
+wl[is.na(wl$CAN_AGE_AT_LISTING), "CAN_AGE_AT_LISTING"] = 47.48    # Mean value
+wl$rec_age_type = "RA3"      # Recipient with age >=65
+wl[(wl$CAN_AGE_AT_LISTING < 45), "rec_age_type"] = "RA1"
+wl[(wl$CAN_AGE_AT_LISTING >= 45) & (wl$CAN_AGE_AT_LISTING < 65), "rec_age_type"] = "RA2"
+
+wl$CAN_LIFE_SUPPORT = as.character(wl$CAN_LIFE_SUPPORT)
+wl$CAN_LIFE_SUPPORT = gsub("b'", "", wl$CAN_LIFE_SUPPORT)
+wl$CAN_LIFE_SUPPORT = gsub("'", "", wl$CAN_LIFE_SUPPORT)
+
+wl$rec_life_sup = "No"
+wl[(!is.na(wl$CAN_LIFE_SUPPORT) & (wl$CAN_LIFE_SUPPORT == "Y")), "rec_life_sup"] = "Yes"
+
+wl$rec_med_cond = "NH"    # Missing is treated as 'not-hospitalized' in graft survival model of SRTR (See HZ coefficients)
+wl[(!is.na(wl$CAN_MED_COND)) & (wl$CAN_MED_COND == 2), "rec_med_cond"] = "H"
+wl[(!is.na(wl$CAN_MED_COND)) & (wl$CAN_MED_COND == 1), "rec_med_cond"] = "ICU"
+
+table(wl$rec_age_type); table(wl$rec_life_sup); table(wl$rec_med_cond)
+```
+
+# Consider only "Adult patients":
+```{r}
+df = subset(df, pat_type == "adult")
+df$CANHX_BEGIN_DT = as.Date(df$CANHX_BEGIN_DT)
+
+# Remove PX_IDs with associated MELD < 6, >40:
+#table(df1$nxt_CANHX_STAT_CD_desp)
+temp = df
+temp$STAT1 = as.numeric(sapply(temp$MELD_col_desp, function(x) {strsplit(as.character(x), split = " ")[[1]][2]}))  # Can output "NAs introduced by coercion"...for '6-14, 15-24,'
+temp$STAT2 = as.numeric(sapply(temp$nxt_MELD_col_desp, function(x) {strsplit(as.character(x), split = " ")[[1]][2]}))
+
+rem_PX_IDs = unique(subset(temp, (((STAT1 < 6) | (STAT1 > 40)) & (STAT1 != 1)))$PX_ID)  # !=1 since we don not want to consider 'Status 1' cases.
+rem_PX_IDs = unique(c(rem_PX_IDs, subset(temp, (((STAT2 < 6) | (STAT2 > 40)) & (STAT2 != 1)))$PX_ID))
+rem_PX_IDs = unique(c(rem_PX_IDs, subset(temp, ((MELD_col_desp == "MELD/PELD 1") | (nxt_MELD_col_desp == "MELD/PELD 1")))$PX_ID))
+
+temp = temp[order(temp$PX_ID, temp$CANHX_BEGIN_DT), ]
+temp = data.table(temp)[, cum_time_period_wait := cumsum(time_period_wait), by = list(PX_ID)]
+
+min(temp$CANHX_BEGIN_DT); max(temp$CANHX_BEGIN_DT)
+
+temp1 = temp
+temp = temp1
+```
+
+# Death event cenoring:
+```{r}
+temp = subset(temp, !is.na(nxt_MELD_col_desp))
+# Censoring event:
+censoring_nxt_MELD_col_desp = c("Temporarily Inactive", "Candidate condition deteriorated , too sick for tx", "Candidate condition improved, tx not needed", 
+                                                    "Candidate Removed in Error", "Deceased Donor Emergency Tx",
+                                                    "Deceased Donor tx, removed by transplanting center", "Living Donor tx, removed by transplanting center", 
+                                                    "Medically Unsuitable", "Other", "Patient died during TX procedure", "Refused transplant",
+                                                    "Transferred to another center", "Transplant at another center (multi-listed)", 
+                                                    "Transplanted in another country", "Unable to contact candidate")
+
+temp$censoring_event = ifelse(temp$nxt_MELD_col_desp %in% censoring_nxt_MELD_col_desp, 1, 0)
+
+# Censoring the data: 
+# Drop all observations after the FIRST censoring_event:
+temp = temp[order(temp$PX_ID, temp$CANHX_BEGIN_DT), ]
+temp = data.table(temp)[, cum_censoring_event := cumsum(censoring_event), by = list(PX_ID)]
+temp = subset(temp, cum_censoring_event <= 1); temp = subset(temp, select = -cum_censoring_event)
+
+# Assigning '(Death/Event) Status' :
+temp$Died = ifelse(temp$nxt_MELD_col_desp == "Died", 1, 0) # ; summary(temp$Died)
+
+### Cross-check:
+table(temp[temp$nxt_MELD_col_desp == "Died", "CAN_REM_CD_desp"])
+# length(setdiff(unique(subset(temp, CAN_REM_CD_desp == "Died")$PX_ID), unique(subset(temp, nxt_MELD_col_desp == "Died")$PX_ID)))  #...Might have Died later on...
+samp = subset(temp, PX_ID == "774109")  # 439543
+###
+
+df1 = temp
+
+summary(df1$cum_time_period_wait)
+
+# Limiting the "cum_time_period_wait"
+???
+df1 = subset(df1, cum_time_period_wait <= 1000)
+
+rm(temp)
+```
+
+# Adding patient's information, and trimming observations:
+```{r}
+df1 = merge(df1, wl[, c("PX_ID", "rec_age_type", "rec_life_sup", "rec_med_cond")], all.x = T)
+sum(is.na(df1$rec_life_sup))
+
+uniqueN(df1$PX_ID) - sum(df1$censoring_event)  - sum(df1$Died == 1)  # Still waiting!
+
+# Drop these patients, instead of censoring them at the last date:
+temp = data.table(df1)[, list(if_censoring_event = max(censoring_event), if_Died = max(Died)), by = list(PX_ID)]
+
+rem_PX_IDs = subset(temp, (if_censoring_event == 0) & (if_Died == 0))$PX_ID
+samp = subset(df1, PX_ID == "559036") 
+
+df1 = subset(df1, !(PX_ID %in% rem_PX_IDs))
+
+# Preparing data in the format for analysis:
+df1 = data.table(df1)[, earliest_date := ifelse(CANHX_BEGIN_DT == min(CANHX_BEGIN_DT), 1, 0), by = list(PX_ID)]
+df1 = data.table(df1)[, latest_date := ifelse(CANHX_BEGIN_DT == max(CANHX_BEGIN_DT), 1, 0), by = list(PX_ID)]
+
+df2 = subset(df1, latest_date == 1); uniqueN(df1$PX_ID)
+temp1 = df1[df1$earliest_date == 1, c("PX_ID", "MELD_col_desp")]; colnames(temp1)[2] = "INIT_MELD_col_desp"
+df2 = merge(df2, temp1, by = "PX_ID")
+
+df2 = df2[, c("PX_ID", "INIT_MELD_col_desp", "rec_age_type", "rec_life_sup", "rec_med_cond", "cum_time_period_wait", "Died")]
+df2 = subset(df2, INIT_MELD_col_desp %in% c("MELD/PELD 6-14", "MELD/PELD 15-28", "MELD/PELD 29-32", "MELD/PELD 33-34", "MELD/PELD 35-36", "MELD/PELD >36"))
+
+df2 = droplevels(df2)
+```
+
+# Survival modeling, Cox-Proportional hazards model (Source: https://www.emilyzabor.com/tutorials/survival_analysis_in_r_tutorial.html#Part_1:_Introduction_to_Survival_Analysis):
+```{r}
+Surv(df2$cum_time_period_wait, df2$Died)[1:10]
+
+f1 <- survfit(Surv(cum_time_period_wait, Died) ~ 1, data = df2)
+
+names(f1)
+
+plot(survfit(Surv(cum_time_period_wait, Died) ~ 1, data = df2), 
+     xlab = "Days", 
+     ylab = "Overall survival probability")
+```
+
+```{r}
+# Estimate the probability of survivng to 1 year:
+cond = (df2$INIT_MELD_col_desp == "MELD/PELD 15-28") & (df2$rec_age_type == "RA2") & (df2$rec_life_sup == "No") & (df2$rec_med_cond == "NH")
+
+# df2$temp = paste0(df2$INIT_MELD_col_desp, df2$rec_age_type, df2$rec_life_sup, df2$rec_med_cond, sep = "_")
+# sort(table(df2$temp), decreasing = T)
+
+summary(survfit(Surv(cum_time_period_wait, Died) ~ 1, data = df2[cond, ]), times = 365.25)
+
+# Comparing survival times between groups:
+survdiff(Surv(cum_time_period_wait, Died) ~ INIT_MELD_col_desp, data = df2)    # INIT_MELD_col_desp, "rec_age_type", "rec_life_sup", "rec_med_cond"
+
+```
+
+```{r}
+# The Cox regression model
+df2$INIT_MELD_col_desp = relevel(as.factor(df2$INIT_MELD_col_desp), ref = "MELD/PELD 15-28")
+df2$rec_age_type = relevel(as.factor(df2$rec_age_type), ref = "RA2")
+df2$rec_life_sup = relevel(as.factor(df2$rec_life_sup), ref = "No")
+df2$rec_med_cond = relevel(as.factor(df2$rec_med_cond), ref = "NH")
+
+mv_fit = coxph(Surv(cum_time_period_wait, Died) ~ INIT_MELD_col_desp + rec_age_type + rec_life_sup + rec_med_cond, data = df2)    # INIT_MELD_col_desp, "rec_age_type", "rec_life_sup", "rec_med_cond"   # Coeff. order as expected!
+
+mv_fit
+
+# S(t=1year) = 0.898^exp(beta.X)
+```
+
+```{r}
+# Hypothesis test of whether the effect of each covariate differs according to time, and a global test of all covariates at once.
+# 1. This is done by testing for an interaction effect between the covariate and log(time)
+#    A significant p-value indicates that the proportional hazards assumption is violated
+# 2. Plots of the Schoenfeld residuals
+#    Deviation from a zero-slope line is evidence that the proportional hazards assumption is violated; In our case, the assmptions seem to hold true for t that is not large!
+mv_fit <- coxph(Surv(cum_time_period_wait, Died) ~ INIT_MELD_col_desp + rec_age_type + rec_life_sup + rec_med_cond, data = df2)
+cz <- cox.zph(mv_fit)
+print(cz)
+plot(cz)
+```
+
+
+# Calculate cumulative HZ ratio:
+```{r}
+haz_ratio_WL_S1 = function(wl1, i) {     # 1 year WL survival model (without a transplant)
+  val = 0
+  
+  x = wl1$INIT_MELD_col_desp[i]
+  if (x == "MELD/PELD 6-14") {val = val + -0.79969}
+  else if (x == "MELD/PELD 29-32") {val = val + 1.28814}
+  else if (x == "MELD/PELD 33-34") {val = val + 1.50085}
+  else if (x == "MELD/PELD 35-36") {val = val + 1.78703}
+  else if (x == "MELD/PELD >36") {val = val + 2.41966}
+  
+  x = wl1$rec_age_type[i]     # Recipient age
+  if (x == "RA1") {val = val + -0.46244}
+  else if (x == "RA3") {val = val + 0.24969}
+  
+  x = wl1$rec_life_sup[i]
+  if (x == "Yes") {val = val + 0.98034}
+  
+  x = wl1$rec_med_cond[i]
+  if (x == "H") {val = val + 0.50202}
+  else if (x == "ICU") {val = val + 0.72883}
+  
+  return (exp(val))
+}
+```
+
+```{r}
+# wl1$WL_hr = sapply(c(1:nrow(wl1)), function(i) {haz_ratio_WL_S1(wl1, i)})
+# 
+# S0 = 0.898
+# wl1$WL_S1 = S0^wl1$WL_hr    # Waiting list survival at the end of 1 year!
+```
+
+# 'mean_GSi' as a function of "donor/organ" and "patient" characteristics: NOT REQUIRED!
+```{r}
+# ref1 = read.csv(paste0(fol_, "/Analysis/temp_Julia/mean_GSi_G6AC_48org_det_waitcost_NoN_after_Y_3RA.csv"), stringsAsFactors = F)
+```
+
+
+##############
+# Survival benefit of transplantation:
+```{r}
+df3 = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/DSA/Two_pat_types_Ref_change/share15/Uti_sim/df_tx_share15.csv"), stringsAsFactors = F)
+temp = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/DSA/Two_pat_types_Ref_change/share35/Uti_sim/df_tx_share35.csv"), stringsAsFactors = F)
+temp = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/DSA/Two_pat_types_Ref_change/sd_match/Uti_sim/df_tx_sd_match.csv"), stringsAsFactors = F)
+
+df3 = rbind.fill(df3, temp)
+
+nrow(df3) / (max(df3$iter) * uniqueN(df3$policy))
+
+# Waiting list survival at the end of 1 year!
+df3$INIT_MELD_col_desp = df3$current_MELD    # CANNOT BE "current_MELD"!!!...has to be INITIAL MELD????!
+df3$WL_hr = sapply(c(1:nrow(df3)), function(i) {haz_ratio_WL_S1(df3, i)})
+
+## Temporary:
+S0 = 0.875    # 0.898
+## \
+
+df3$WL_S1 = S0^df3$WL_hr  
+summary(df3$WL_S1); summary(df3$mean_GSi)
+
+df3$benefit = df3$mean_GSi - df3$WL_S1
+summary(df3$benefit)    # Should be POSITIVE!!!!, BUT IS NOT THE CASE!!!
+temp = data.table(df3)[, list(mean_diff_mean_GSi_WL_S1 = mean(mean_GSi) - mean(WL_S1)), by = list(policy)]
+
+ggplot(df3, aes(x=as.factor(policy), y=benefit, color=as.factor(policy))) +
+  geom_boxplot()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+

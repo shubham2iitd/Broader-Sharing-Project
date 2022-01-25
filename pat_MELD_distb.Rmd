@@ -1,0 +1,281 @@
+
+```{r}
+library(data.table)
+library(readxl)
+library(openxlsx)
+library(ggplot2)
+library(maptools)
+library(foreign)
+library(plyr)
+library(haven)
+```
+
+```{r}
+state_agg = 0
+agg_level = "G5"
+sheet_MELD_class = paste0("transition_agg_", agg_level)
+MELD_col_name = "CANHX_STAT_CD"
+```
+
+
+```{r}
+df_src = read.csv("C:/Users/sakshat/Google Drive/SRTR/Analysis/Transition_matrix/stathist_liin_v2.csv")
+# df_src = read.csv(paste0("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/", agg_level, "/", MELD_col_name, "/stathist_liin_nxt_state_time_adj_", agg_level, "_", MELD_col_name, ".csv")) # has the same number of records as 'stathist_liin_v2.csv'
+names(df_src)
+```
+
+```{r}
+df = df_src
+
+# Aggregate the states:
+if (state_agg == 1) {
+  ref = read_excel("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/ptr_li_sample.xlsx", sheet = sheet_MELD_class)
+  df = merge(df, ref, by = c("CANHX_STAT_CD", "CANHX_STAT_CD_desp"), all.x = T)
+  df = df[, -which(names(df) %in% c("CANHX_STAT_CD", "CANHX_STAT_CD_desp"))]
+  
+  # Rename the column back to original:
+  names(df)[which(names(df) %in% c("new_CANHX_STAT_CD"))] = "CANHX_STAT_CD"
+  names(df)[which(names(df) %in% c("new_CANHX_STAT_CD_desp"))] = "CANHX_STAT_CD_desp"
+  
+  df$CANHX_STAT_CD = as.character(df$CANHX_STAT_CD)
+  unique(df$CANHX_STAT_CD_desp)
+}
+```
+
+```{r}
+df$CANHX_BEGIN_DT = as.Date(df$CANHX_BEGIN_DT, "%Y-%m-%d")
+df$CANHX_END_DT = as.Date(df$CANHX_END_DT, "%Y-%m-%d")
+min(df$CANHX_BEGIN_DT); max(df$CANHX_BEGIN_DT)
+```
+
+```{r}
+# Month wise (Year 2017):
+# date_lst = c("2017-01-01", "2017-02-01", "2017-03-01", "2017-04-01", "2017-05-01", "2017-06-01", "2017-07-01", "2017-08-01", "2017-09-01", "2017-10-01", "2017-11-01", "2017-12-01")
+# # All days in January, 2017:
+# date_lst = seq(as.Date("2017-01-01", "%Y-%m-%d"), as.Date("2017-01-31", "%Y-%m-%d"), by = "day")
+
+# Month wise: 2010-2018
+date_lst = seq(as.Date("2010-01-01", "%Y-%m-%d"), as.Date("2018-12-01", "%Y-%m-%d"), by = "month")
+
+wl = read.csv("C:/Users/sakshat/Google Drive/SRTR/Analysis/waitlist.csv")
+# Vlookup CANDIDATE's information using PX_ID:
+wl1 = wl[, c("PX_ID", "CAN_AGE_IN_MONTHS_AT_LISTING", "CAN_OPO_CD", "CAN_OPO_REGION", "CAN_CTR_CD")]
+
+if (state_agg == 1) {
+  # avg_df = data.frame(CAN_OPO_CD=rep(0,52), cnt=rep(0,52), MELD_6_14=rep(0,52), MELD_15_24=rep(0,52), MELD_25_29=rep(0,52), MELD_30_34=rep(0,52), MELD_35=rep(0,52), MELD_36=rep(0,52), MELD_37=rep(0,52), MELD_38=rep(0,52), MELD_39=rep(0,52), MELD_40=rep(0,52), St1=rep(0,52))
+  
+  # rel_MELD_cat = c("MELD/PELD 6-14", "MELD/PELD 15-24", "MELD/PELD 25-29", "MELD/PELD 30-34", "MELD/PELD 35", "MELD/PELD 36", "MELD/PELD 37", "MELD/PELD 38", "MELD/PELD 39", "MELD/PELD 40", "Status 1")
+  rel_MELD_cat = c("MELD/PELD 6-14", "MELD/PELD 15-24", "MELD/PELD 25-29", "MELD/PELD 30-34", "MELD/PELD >34")
+  df2 = df[df$CANHX_STAT_CD_desp %in% rel_MELD_cat, ]
+  
+  df2 = merge(df2, wl1, by = "PX_ID", all.x = T)
+  #uniqueN(df2[is.na(df2$CAN_CTR_CD), "PX_ID"])   # 13 PX_IDs do not have DSA info:
+  #uniqueN(df2$PX_ID)
+  
+  avg_df = unique(df2[, c("CAN_OPO_CD", "CAN_OPO_REGION")])
+  avg_df = subset(avg_df, !is.na(CAN_OPO_CD))
+  avg_df = avg_df[order(avg_df$CAN_OPO_CD), ]; avg_df$idx = c(1:nrow(avg_df))
+  avg_df$cnt = 0; avg_df$MELD_6_14 = 0; avg_df$MELD_15_24 = 0; avg_df$MELD_25_29 = 0; avg_df$MELD_30_34 = 0; avg_df$MELD_35_ = 0;
+  
+  date_lst = as.character(date_lst); date_lst_pre = date_lst[1:42]; date_lst_post = date_lst[43:108]
+  k = 0
+  for (ref_date in date_lst) {
+    k = k + 1
+    # Cross-section of patient's state at "ref_date":
+    cond = (df2$CANHX_BEGIN_DT < ref_date) & (df2$CANHX_END_DT > ref_date)
+    df1 = df2[cond, ]
+    df1 = df1[!is.na(df1$CAN_CTR_CD), ]
+    #uniqueN(df1$PX_ID)
+    
+    # Why uniqueN(df1$PX_ID) > nrow(df1) ???
+    # remove duplicates??
+    # Can ignore the issue now becuse later on, after filtering out some of the MELD states (CANHX_STAT_CD_desp), no. of PX_IDs = nrow(dataframe)
+
+    temp = data.table(df1)[, list(cnt = .N, MELD_6_14 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[1])/.N, MELD_15_24 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[2])/.N, 
+                                  MELD_25_29 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[3])/.N, MELD_30_34 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[4])/.N,
+                                  MELD_35_ = sum(CANHX_STAT_CD_desp == rel_MELD_cat[5])/.N
+                                  MELD_35 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[5])/.N, MELD_36 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[6])/.N, 
+                                  MELD_37 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[7])/.N, MELD_38 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[8])/.N, 
+                                  MELD_39 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[9])/.N, MELD_40 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[10])/.N, 
+                                  St1 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[11])/.N
+                                  ), by = list(CAN_OPO_CD, CAN_OPO_REGION)]
+    temp = data.frame(temp)
+    
+    temp = merge(avg_df[, c("CAN_OPO_CD", "CAN_OPO_REGION", "idx")], temp, all.x = T)
+    temp[is.na(temp)] = 0
+    temp = temp[order(temp$idx), ]
+    
+    avg_df[, -c(1,2,3)] = avg_df[, -c(1,2,3)] + temp[, -c(1,2,3)]
+  }
+  avg_df[, -c(1,2,3)] = avg_df[, -c(1,2,3)] / k # length(date_lst)
+} else if (state_agg == 0) {
+  
+  print ("Need to work on the below code!")
+  # avg_df = data.frame(CAN_OPO_CD=rep(0,52), cnt=rep(0,52), MELD_6=rep(0,52), MELD_7=rep(0,52), MELD_8=rep(0,52), MELD_9=rep(0,52), MELD_10=rep(0,52), MELD_11=rep(0,52), MELD_12=rep(0,52), MELD_13=rep(0,52), MELD_14=rep(0,52), MELD_15=rep(0,52), MELD_16=rep(0,52), MELD_17=rep(0,52), MELD_18=rep(0,52), MELD_19=rep(0,52), MELD_20=rep(0,52), MELD_21=rep(0,52), MELD_22=rep(0,52), MELD_23=rep(0,52), MELD_24=rep(0,52), MELD_25=rep(0,52), MELD_26=rep(0,52), MELD_27=rep(0,52), MELD_28=rep(0,52), MELD_29=rep(0,52), MELD_30=rep(0,52), MELD_31=rep(0,52), MELD_32=rep(0,52), MELD_33=rep(0,52), MELD_34=rep(0,52), MELD_35=rep(0,52), MELD_36=rep(0,52), MELD_37=rep(0,52), MELD_38=rep(0,52), MELD_39=rep(0,52), MELD_40=rep(0,52), St1=rep(0,52))
+  # 
+  # # avg_df = avg_df[1:11, ]
+  # 
+  # for (ref_date in date_lst) {
+  # 
+  #   # Cross-section of patient's state at "ref_date":
+  #   cond = (df$CANHX_BEGIN_DT <= ref_date) & (df$CANHX_END_DT >= ref_date)
+  #   df1 = df[cond, ]
+  #   #uniqueN(df1$PX_ID)
+  #   
+  #   # Why uniqueN(df1$PX_ID) > nrow(df1) ???
+  #   # remove duplicates??
+  #   # Can ignore the issue now becuse later on, after filtering out some of the MELD states (CANHX_STAT_CD_desp), no. of PX_IDs = nrow(dataframe)
+  #   
+  #   # unique(df1$CANHX_STAT_CD_desp)
+  #   rel_MELD_cat = c("MELD/PELD 6", "MELD/PELD 7", "MELD/PELD 8", "MELD/PELD 9", "MELD/PELD 10", "MELD/PELD 11", "MELD/PELD 12", "MELD/PELD 13", "MELD/PELD 14", "MELD/PELD 15", "MELD/PELD 16", "MELD/PELD 17", "MELD/PELD 18", "MELD/PELD 19", "MELD/PELD 20", "MELD/PELD 21", "MELD/PELD 22", "MELD/PELD 23", "MELD/PELD 24", "MELD/PELD 25", "MELD/PELD 26", "MELD/PELD 27", "MELD/PELD 28", "MELD/PELD 29", "MELD/PELD 30", "MELD/PELD 31", "MELD/PELD 32", "MELD/PELD 33", "MELD/PELD 34", "MELD/PELD 35", "MELD/PELD 36", "MELD/PELD 37", "MELD/PELD 38", "MELD/PELD 39", "MELD/PELD 40", "Status 1")
+
+  #   
+  #   temp = data.table(df2[!is.na(df2$CAN_CTR_CD), ])[, list(cnt = .N, MELD_6 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[1])/.N, MELD_7 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[2])/.N,
+  #                                 MELD_8 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[3])/.N, MELD_9 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[4])/.N,
+  #                                 MELD_10 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[5])/.N, MELD_11 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[6])/.N,
+  #                                 MELD_12 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[7])/.N, MELD_13 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[8])/.N,
+  #                                 MELD_14 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[9])/.N, MELD_15 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[10])/.N,
+  #                                 MELD_16 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[11])/.N, MELD_17 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[12])/.N,
+  #                                 MELD_18 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[13])/.N, MELD_19 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[14])/.N,
+  #                                 MELD_20 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[15])/.N, MELD_21 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[16])/.N,
+  #                                 MELD_22 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[17])/.N, MELD_23 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[18])/.N,
+  #                                 MELD_24 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[19])/.N, MELD_25 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[20])/.N,
+  #                                 MELD_26 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[21])/.N, MELD_27 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[22])/.N,
+  #                                 MELD_28 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[23])/.N, MELD_29 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[24])/.N,
+  #                                 MELD_30 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[25])/.N, MELD_31 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[26])/.N,
+  #                                 MELD_32 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[27])/.N, MELD_33 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[28])/.N,
+  #                                 MELD_34 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[29])/.N, MELD_35 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[30])/.N,
+  #                                 MELD_36 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[31])/.N, MELD_37 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[32])/.N,
+  #                                 MELD_38 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[33])/.N, MELD_39 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[34])/.N,
+  #                                 MELD_40 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[35])/.N, St1 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[36])/.N), by = list(CAN_OPO_CD)]  # CAN_OPO_CD, WL_ORG
+}
+
+#avg_df$CAN_OPO_CD = temp$CAN_OPO_CD
+#avg_df$CAN_OPO_REGION = temp$CAN_OPO_REGION
+# avg_df = avg_df[, c(ncol(avg_df), 2:(ncol(avg_df)-1))]
+```
+
+```{r}
+# Steps:
+## 1. First define the geography, first column of 'avg_df', 2. Modify 'df2$geog' accordingly
+if (state_agg == 0) {
+  
+  wl1$Overall = "Aggregated"
+  geog_lst = unique(wl1$Overall)    # CAN_OPO_REGION
+  n = length(geog_lst)
+  
+  avg_df = data.frame(geog=geog_lst, cnt=rep(0,n), MELD_6=rep(0,n), MELD_7=rep(0,n), MELD_8=rep(0,n), MELD_9=rep(0,n), MELD_10=rep(0,n), MELD_11=rep(0,n), MELD_12=rep(0,n), MELD_13=rep(0,n), MELD_14=rep(0,n), MELD_15=rep(0,n), MELD_16=rep(0,n), MELD_17=rep(0,n), MELD_18=rep(0,n), MELD_19=rep(0,n), MELD_20=rep(0,n), MELD_21=rep(0,n), MELD_22=rep(0,n), MELD_23=rep(0,n), MELD_24=rep(0,n), MELD_25=rep(0,n), MELD_26=rep(0,n), MELD_27=rep(0,n), MELD_28=rep(0,n), MELD_29=rep(0,n), MELD_30=rep(0,n), MELD_31=rep(0,n), MELD_32=rep(0,n), MELD_33=rep(0,n), MELD_34=rep(0,n), MELD_35=rep(0,n), MELD_36=rep(0,n), MELD_37=rep(0,n), MELD_38=rep(0,n), MELD_39=rep(0,n), MELD_40=rep(0,n), St1=rep(0,n))
+  avg_df = avg_df[order(avg_df$geog), ]
+  
+  for (ref_date in date_lst) {
+
+    # Cross-section of patient's state at "ref_date":
+    cond = (df$CANHX_BEGIN_DT <= ref_date) & (df$CANHX_END_DT >= ref_date)
+    df1 = df[cond, ]
+    #uniqueN(df1$PX_ID)
+
+    # Why uniqueN(df1$PX_ID) > nrow(df1) ???
+    # remove duplicates??
+    # Can ignore the issue now becuse later on, after filtering out some of the MELD states (CANHX_STAT_CD_desp), no. of PX_IDs = nrow(dataframe)
+
+    # unique(df1$CANHX_STAT_CD_desp)
+    rel_MELD_cat = c("MELD/PELD 6", "MELD/PELD 7", "MELD/PELD 8", "MELD/PELD 9", "MELD/PELD 10", "MELD/PELD 11", "MELD/PELD 12", "MELD/PELD 13", "MELD/PELD 14", "MELD/PELD 15", "MELD/PELD 16", "MELD/PELD 17", "MELD/PELD 18", "MELD/PELD 19", "MELD/PELD 20", "MELD/PELD 21", "MELD/PELD 22", "MELD/PELD 23", "MELD/PELD 24", "MELD/PELD 25", "MELD/PELD 26", "MELD/PELD 27", "MELD/PELD 28", "MELD/PELD 29", "MELD/PELD 30", "MELD/PELD 31", "MELD/PELD 32", "MELD/PELD 33", "MELD/PELD 34", "MELD/PELD 35", "MELD/PELD 36", "MELD/PELD 37", "MELD/PELD 38", "MELD/PELD 39", "MELD/PELD 40", "Status 1")
+
+    df1 = df1[df1$CANHX_STAT_CD_desp %in% rel_MELD_cat, ]
+  
+    df2 = merge(df1, wl1, by = "PX_ID", all.x = T); sum(is.na(df2$CAN_OPO_REGION)); sum(is.na(df2$CAN_OPO_CD))
+    
+    # VVI : Enter the column name:
+    df2$geog = df2$Overall
+    df2 = df2[df2$geog %in% geog_lst, ]
+  
+    temp = data.table(df2)[, list(cnt = .N, 
+                                  MELD_6 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[1])/.N, MELD_7 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[2])/.N,
+                                  MELD_8 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[3])/.N, MELD_9 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[4])/.N,
+                                  MELD_10 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[5])/.N, MELD_11 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[6])/.N,
+                                  MELD_12 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[7])/.N, MELD_13 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[8])/.N,
+                                  MELD_14 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[9])/.N, MELD_15 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[10])/.N,
+                                  MELD_16 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[11])/.N, MELD_17 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[12])/.N,
+                                  MELD_18 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[13])/.N, MELD_19 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[14])/.N,
+                                  MELD_20 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[15])/.N, MELD_21 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[16])/.N,
+                                  MELD_22 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[17])/.N, MELD_23 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[18])/.N,
+                                  MELD_24 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[19])/.N, MELD_25 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[20])/.N,
+                                  MELD_26 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[21])/.N, MELD_27 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[22])/.N,
+                                  MELD_28 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[23])/.N, MELD_29 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[24])/.N,
+                                  MELD_30 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[25])/.N, MELD_31 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[26])/.N,
+                                  MELD_32 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[27])/.N, MELD_33 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[28])/.N,
+                                  MELD_34 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[29])/.N, MELD_35 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[30])/.N,
+                                  MELD_36 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[31])/.N, MELD_37 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[32])/.N,
+                                  MELD_38 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[33])/.N, MELD_39 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[34])/.N,
+                                  MELD_40 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[35])/.N, St1 = sum(CANHX_STAT_CD_desp == rel_MELD_cat[36])/.N), by = list(geog)]
+    temp = data.frame(temp)
+    
+    temp = merge(avg_df[, c("geog", "cnt")], temp, by = "geog", all.x = T)
+    # Remove the extra "cnt.x" and rename "cnt.y":
+    temp = temp[, !(names(temp) == "cnt.x")]; colnames(temp)[which(colnames(temp) == "cnt.y")] = "cnt"
+    temp[is.na(temp)] = 0
+    temp = temp[order(temp$geog), ]
+    
+    avg_df[, -c(1)] = avg_df[, -c(1)] + temp[, -c(1)]
+  }
+  avg_df[, -c(1)] = avg_df[, -c(1)] / length(date_lst)
+}
+```
+
+# Write the files:
+```{r}
+write.csv(avg_df, "C:/Users/sakshat/Google Drive/Health Care/Cont_distb/temp.csv", row.names = F)
+# write.csv(avg_df, "/Volumes/GoogleDrive/My Drive/SRTR/Analysis/Transition_matrix/temp.csv", row.names = F)
+# write.csv(avg_df, "/Volumes/GoogleDrive/My Drive/Health Care/Optimized Overlapping Organ Allocation/Cont_distb/pat_MELD_distb_2017_18.csv", row.names = F)
+```
+
+# New candidate arrivals in 2017, who reached above a certain MELD threshold:
+```{r}
+cond = (df$CANHX_BEGIN_DT <= "2018-01-01") & (df$CANHX_END_DT >= "2017-01-01")
+
+MELD_cat_to_cnt_pat = c("MELD/PELD 15-24", "MELD/PELD 25-29", "MELD/PELD 30-34", "MELD/PELD 35", "MELD/PELD 36", "MELD/PELD 37", "MELD/PELD 38", "MELD/PELD 39", "MELD/PELD 40", "Status 1")
+old_pat = unique(df[(df$CANHX_BEGIN_DT <= "2017-01-01") & (df$CANHX_STAT_CD_desp %in% MELD_cat_to_cnt_pat), ]$PX_ID)
+
+df_2017 = df[cond & (df$CANHX_STAT_CD_desp %in% MELD_cat_to_cnt_pat) & !(df$PX_ID %in% old_pat), ]
+df_2017 = merge(df_2017, wl1, by = "PX_ID", all.x = T)
+summary(df_2017$CAN_AGE_IN_MONTHS_AT_LISTING)
+df_2017 = df_2017[df_2017$CAN_AGE_IN_MONTHS_AT_LISTING >= 18*12, ]
+
+
+temp = data.table(df_2017[!is.na(df_2017$CAN_CTR_CD), ])[, list(new_pat_arr_cnt = uniqueN(PX_ID)), by = list(CAN_OPO_CD, CAN_OPO_REGION)]
+```
+
+# New organ arrivals in 2017:
+```{r}
+don = read.csv("/Volumes/GoogleDrive/My Drive/SRTR/Analysis/donor.csv")
+don$date <- as.Date(don$date, format= "%Y-%m-%d")
+
+don_2017 = don[(don$date <= "2018-01-01") & (don$date >= "2017-01-01"), ]
+names(don_2017)
+
+temp_don = data.table(don_2017[!is.na(don_2017$DON_OPO_CTR_CD), ])[, list(new_org_arr_cnt = uniqueN(DONOR_ID)), by = list(DON_OPO_CTR_CD, DON_OPO_REGION)]
+
+sd = merge(temp, temp_don, by.x = c("CAN_OPO_CD", "CAN_OPO_REGION"), by.y = c("DON_OPO_CTR_CD", "DON_OPO_REGION"))
+sd$sd_ratio = sd$new_org_arr_cnt / sd$new_pat_arr_cnt
+```
+
+```{r}
+write.csv(sd, "/Volumes/GoogleDrive/My Drive/Health Care/Optimized Overlapping Organ Allocation/Paper_writing/sd_2017.csv", row.names = F)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

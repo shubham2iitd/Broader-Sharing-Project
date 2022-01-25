@@ -1,0 +1,777 @@
+
+```{r}
+library(data.table)
+library(readxl)
+library(openxlsx)
+library(ggplot2)
+library(maptools)
+library(foreign)
+library(plyr)
+library(haven)
+library(survival)
+library(reshape2)
+
+print ("_-")
+```
+
+```{r}
+computer = "imac" # mac, imac, windows
+
+if (computer == "imac") {
+  fol_ = "/Users/sakshat/Google Drive/SRTR"
+} else if (computer == "mac") {
+  fol_ = "/Users/shubham/Google Drive/SRTR"
+} else if (computer == "windows") {
+  fol_ = "C:/Users/sakshat/Google Drive/SRTR"
+}
+```
+
+```{r}
+state_agg = 1
+agg_level = "G6AC"
+sheet_MELD_class = paste0("transition_agg_", agg_level) # "transition_agg_G11" # "transition_agg_SIMPLE"
+
+MELD_col_name = "CANHX_STAT_CD" # "CANHX_OPTN_LAB_MELD" # "CANHX_STAT_CD" # "CANHX_SRTR_LAB_MELD  # Columns to indicate the MELD during the WL period
+MELD_col_desp_name = paste0(MELD_col_name, "_desp")
+```
+
+# Read the file ("Transplant Follow-up"):
+```{r}
+df_src = read.csv(paste0(fol_, "/From SRTR/pubsaf1903/txf_li.csv"), stringsAsFactors = F)
+```
+
+```{r}
+df = df_src[, c("PX_ID", "REC_TX_DT", "ORG_TY", "REC_TX_ORG_TY", "REC_TX_TY", "TFL_PX_STAT_DT", "TFL_FOL_CD", "TFL_GRAFT_STAT", "TFL_FUNCTN_STAT", "TFL_PX_STAT", "TFL_FAIL_DT", "TFL_COD")]
+
+lst = c("ORG_TY", "REC_TX_ORG_TY", "TFL_GRAFT_STAT", "TFL_PX_STAT")
+for (col in lst) {
+  df[, col] = as.character(df[, col])
+  df[, col] = gsub("b'", "", df[, col])
+  df[, col] = gsub("'", "", df[, col])
+}
+
+df$REC_TX_DT = as.Date(df$REC_TX_DT, format= "%Y-%m-%d")
+df$TFL_PX_STAT_DT = as.Date(df$TFL_PX_STAT_DT, format= "%Y-%m-%d")
+df$TFL_FAIL_DT = as.Date(df$TFL_FAIL_DT, format= "%Y-%m-%d")
+
+```
+
+# Summarizing the data:
+```{r}
+table(df$ORG_TY)   # ALl Livers
+
+table(df$REC_TX_ORG_TY)   # Mostly Liver alone
+df = subset(df, REC_TX_ORG_TY == "LI")
+
+table(df$REC_TX_TY)    # All 1!
+
+min(df$TFL_PX_STAT_DT, na.rm = T); max(df$TFL_PX_STAT_DT, na.rm = T); sum(is.na(df$TFL_PX_STAT_DT))
+df = subset(df, !is.na(TFL_PX_STAT_DT))
+
+nrow(df)/uniqueN(df$PX_ID)    # On verage, 8.37 follow-ups per patient
+
+table(df$TFL_GRAFT_STAT)
+sort(table(df$TFL_FUNCTN_STAT))   # Mosly indicate that graft is funcitioning properly!
+
+sort(table(df$TFL_PX_STAT))
+
+# Cases fow which "Graft failure date" is mentioned!
+sum(!is.na(df$TFL_FAIL_DT)); min(df[!is.na(df$TFL_FAIL_DT), ]$TFL_FAIL_DT); max(df[!is.na(df$TFL_FAIL_DT), ]$TFL_FAIL_DT)
+dff = subset(df, !is.na(TFL_FAIL_DT)); uniqueN(dff$PX_ID)
+
+table(df$TFL_FOL_CD)
+```
+
+# Importing "patient" and "donor" data:
+```{r}
+tx = read.csv(paste0(fol_, "/From SRTR/pubsaf1903/tx_li.csv"), stringsAsFactors = F)
+wl = read.csv(paste0(fol_, "/From SRTR/pubsaf1903/cand_liin.csv"), stringsAsFactors = F)
+# Linking with INSTITUTION data:
+inst = read.csv(paste0(fol_, "/From SRTR/pubsaf1903/institution.csv"), stringsAsFactors = F)
+
+setdiff(unique(dff$PX_ID), tx$PX_ID)   # All patients are found!
+setdiff(unique(dff$PX_ID), wl$PX_ID)   # 62 patients are found!
+
+# Define 'donor type' in tx file:   Based on "org_arrival_v2.Rmd" file:
+summary(tx$DON_AGE)
+summary(tx$DON_RACE)
+table(tx$DON_CAD_DON_COD)
+tx$DON_DCD_SUPPORT_WITHDRAW_TM
+
+tx = subset(tx, !is.na(DON_AGE))
+tx = subset(tx, !is.na(DON_RACE))
+
+# Age:
+
+tx$age_type = "A5" # DON_AGE >= 60
+tx[(tx$DON_AGE < 18), "age_type"] = "A1"
+tx[((tx$DON_AGE >= 18) & (tx$DON_AGE < 40)), "age_type"] = "A2"
+tx[((tx$DON_AGE >= 40) & (tx$DON_AGE < 50)), "age_type"] = "A3"
+tx[((tx$DON_AGE >= 50) & (tx$DON_AGE < 60)), "age_type"] = "A4"
+table(tx$age_type)
+
+# Race:
+## Create 'DON_RACE_desp':
+tx$DON_RACE_desp = "Other"
+tx[tx$DON_RACE == 8, "DON_RACE_desp"] = "White"
+tx[tx$DON_RACE == 2000, "DON_RACE_desp"] = "Hispanic"
+tx[tx$DON_RACE == 16, "DON_RACE_desp"] = "Black"
+table(tx$DON_RACE_desp)/nrow(tx) # 66% White, 13.5% Hispanic, 17% Black, 3.5% Other
+
+tx$race_type = "Other" 
+tx[tx$DON_RACE_desp == "White", "race_type"] = "White"  # 'Hispanic' and 'Other' are clubbed into "Other".
+table(tx$race_type)
+
+# COD:   (Bit deviated from the above mentioned reference code)
+tx[(is.na(tx$DON_CAD_DON_COD)), "cod_type"] = "Other"
+tx[(!is.na(tx$DON_CAD_DON_COD)) & (tx$DON_CAD_DON_COD == 1), "cod_type"] = "Anoxia"
+tx[(!is.na(tx$DON_CAD_DON_COD)) & (tx$DON_CAD_DON_COD == 2), "cod_type"] = "CVA"
+tx[(!is.na(tx$DON_CAD_DON_COD)) & (tx$DON_CAD_DON_COD %in% c(4, 3, 999, 998)), "cod_type"] = "Other"
+
+table(tx$cod_type); sum(is.na(tx$cod_type))
+
+tx1 = tx[, c("PX_ID", "DONOR_ID", "age_type", "race_type", "cod_type", "REC_TX_DT", "CAN_LAST_STAT")]
+
+# DCD:
+don_src = read.csv(paste0(fol_, "/From SRTR/pubsaf1903/donor_deceased.csv"), stringsAsFactors = F)
+don_src = don_src[, c("DONOR_ID", "DON_DCD_SUPPORT_WITHDRAW_TM", "DON_DCD_SUPPORT_WITHDRAW_DT", "DON_OPO_CTR_ID")]
+temp = inst[, c("CTR_ID", "CTR_CD", "REGION")]
+colnames(temp) = c("CTR_ID", "DON_OPO_CD", "DON_OPO_REGION")
+don_src = merge(don_src, temp[, c("CTR_ID", "DON_OPO_CD", "DON_OPO_REGION")], by.x = "DON_OPO_CTR_ID", by.y = "CTR_ID", all.x = T)
+
+tx1 = merge(tx1, don_src, by = "DONOR_ID")
+
+tx1$dcd_type = "Yes"
+tx1[is.na(tx1$DON_DCD_SUPPORT_WITHDRAW_TM), "dcd_type"] = "No"
+table(tx1$dcd_type)
+
+tx1 = tx1[, c("PX_ID", "DONOR_ID", "age_type", "race_type", "cod_type", "dcd_type", "REC_TX_DT", "CAN_LAST_STAT", "DON_OPO_CD", "DON_OPO_REGION")]
+# rm(tx)
+
+length(setdiff(unique(dff$PX_ID), tx1$PX_ID))
+```
+
+# Defining 'recipient type' in wl file:
+```{r}
+wl[is.na(wl$CAN_AGE_AT_LISTING), "CAN_AGE_AT_LISTING"] = 47.48    # Mean value
+wl$rec_age_type = "RA3"      # Recipient with age >=65
+wl[(wl$CAN_AGE_AT_LISTING < 45), "rec_age_type"] = "RA1"
+wl[(wl$CAN_AGE_AT_LISTING >= 45) & (wl$CAN_AGE_AT_LISTING < 65), "rec_age_type"] = "RA2"
+
+wl$CAN_LIFE_SUPPORT = as.character(wl$CAN_LIFE_SUPPORT)
+wl$CAN_LIFE_SUPPORT = gsub("b'", "", wl$CAN_LIFE_SUPPORT)
+wl$CAN_LIFE_SUPPORT = gsub("'", "", wl$CAN_LIFE_SUPPORT)
+
+wl$rec_life_sup = "No"
+wl[(!is.na(wl$CAN_LIFE_SUPPORT) & (wl$CAN_LIFE_SUPPORT == "Y")), "rec_life_sup"] = "Yes"
+
+wl$rec_med_cond = "NH"    # Missing is treated as 'not-hospitalized' in graft survival model of SRTR (See HZ coefficients)
+wl[(!is.na(wl$CAN_MED_COND)) & (wl$CAN_MED_COND == 2), "rec_med_cond"] = "H"
+wl[(!is.na(wl$CAN_MED_COND)) & (wl$CAN_MED_COND == 1), "rec_med_cond"] = "ICU"
+
+table(wl$rec_age_type); table(wl$rec_life_sup); table(wl$rec_med_cond)
+```
+
+# For adding "sharing_type":
+```{r}
+temp = inst[, c("CTR_ID", "CTR_CD", "REGION")]
+colnames(temp) = c("CTR_ID", "CAN_OPO_CD", "CAN_OPO_REGION")
+wl = merge(wl, temp[, c("CTR_ID", "CAN_OPO_CD", "CAN_OPO_REGION")], by.x = "CAN_LISTING_OPO_ID", by.y = "CTR_ID", all.x = T)
+```
+
+
+```{r}
+tx1 = merge(tx1, wl[, c("PX_ID", "rec_age_type", "rec_life_sup", "rec_med_cond", "CAN_OPO_CD", "CAN_OPO_REGION")], by = "PX_ID")
+
+# Adding "sharing_type":
+tx1 = tx1[!is.na(tx1$DON_OPO_REGION), ]
+tx1$sharing_type = "national"
+tx1[tx1$CAN_OPO_CD == tx1$DON_OPO_CD, "sharing_type"] = "local"
+tx1[(tx1$sharing_type != "local") & (tx1$CAN_OPO_REGION == tx1$DON_OPO_REGION), "sharing_type"] = "regional"
+
+table(tx1$sharing_type)
+
+# Adding the "MELD" column:
+temp = read_excel(paste0(fol_, "/Analysis/ptr_li_sample.xlsx"), sheet = "PTR_STAT_CD")
+temp = as.data.frame(temp)
+temp[, 1] = as.character(temp[, 1])
+names(temp)[2] = "CAN_LAST_STAT_desp"
+tx1 = merge(tx1, temp, by.x = "CAN_LAST_STAT", by.y = "Candidate's current Medical Urgency")
+
+ref = read_excel(paste0(fol_, "/Analysis/ptr_li_sample.xlsx"), sheet = paste0("transition_agg_", agg_level))
+tx1 = merge(tx1, unique(ref[, c("CANHX_STAT_CD_desp", "new_CANHX_STAT_CD_desp")]), by.x = "CAN_LAST_STAT_desp", by.y = "CANHX_STAT_CD_desp", all.x = T)
+tx1 = tx1[, -which(colnames(tx1) %in% c("CAN_LAST_STAT_desp", "CAN_LAST_STAT"))]
+colnames(tx1)[which(colnames(tx1) == "new_CANHX_STAT_CD_desp")] = "CAN_last_MELD"
+
+# tx1 = subset(tx1, PX_ID %in% unique(df_trans$PX_ID))
+```
+
+# Importing MELD at the time of transplant: 
+## NO need, SKIP: The imported MELD is the SAME as "CAN_LAST_STAT_desp"!!!!
+```{r}
+df_trans = read.csv(paste0(fol_, "/From SRTR/pubsaf1903/stathist_liin.csv"), stringsAsFactors = F)
+
+df_trans$CANHX_BEGIN_DT = as.Date(df_trans$CANHX_BEGIN_DT, format= "%Y-%m-%d")
+df_trans$CANHX_END_DT = as.Date(df_trans$CANHX_END_DT, format= "%Y-%m-%d")
+
+min(df_trans$CANHX_BEGIN_DT); max(df_trans$CANHX_END_DT, na.rm = T)
+
+df_trans$MELD_col = df_trans[, "CANHX_STAT_CD"]
+
+df_trans = subset(df_trans, PX_ID %in% unique(df1$PX_ID))
+length(setdiff(unique(df1$PX_ID), unique(df_trans$PX_ID)))
+
+tx1$REC_TX_DT = as.Date(tx1$REC_TX_DT, format= "%Y-%m-%d")
+
+MELD_at_tx = function(i) {
+  PX_ID = tx1$PX_ID[i]
+  REC_TX_DT = tx1$REC_TX_DT[i]
+  temp = df_trans[df_trans$PX_ID == PX_ID, ]
+  cond = (temp$CANHX_BEGIN_DT <= REC_TX_DT) & (temp$CANHX_END_DT >= REC_TX_DT)
+  val = temp[cond, ]$MELD_col
+  if (length(val) != 1) {print(paste0(PX_ID))}
+  return (val)
+}
+
+# tx1$MELD_tx = sapply(c(1:nrow(tx1)), function(i) {MELD_at_tx(i)})
+
+library(parallel)
+out = mclapply(c(1:nrow(tx1)), MELD_at_tx)
+
+for (i in c(1:nrow(tx1))) {
+  val = out[i][[1]]
+  if (length(val) > 0) {
+    tx1$MELD_tx[i] = val
+  }
+}
+table(tx1$MELD_tx); sum(is.na(tx1$MELD_tx))
+
+# write.csv(tx1, paste0(fol_, "/Analysis/tx_date_MELD.csv"), row.names = F)
+tx1 = read.csv(paste0(fol_, "/Analysis/tx_date_MELD.csv"), stringsAsFactors = F)
+
+# Adding the "MELD" column:
+temp = read_excel(paste0(fol_, "/Analysis/ptr_li_sample.xlsx"), sheet = "PTR_STAT_CD")
+temp = as.data.frame(temp)
+temp[, 1] = as.character(temp[, 1])
+names(temp)[2] = "MELD_tx_desp"
+tx1 = merge(tx1, temp, by.x = "MELD_tx", by.y = "Candidate's current Medical Urgency")
+
+ref = read_excel(paste0(fol_, "/Analysis/ptr_li_sample.xlsx"), sheet = paste0("transition_agg_", agg_level))
+tx1 = merge(tx1, unique(ref[, c("CANHX_STAT_CD_desp", "new_CANHX_STAT_CD_desp")]), by.x = "MELD_tx_desp", by.y = "CANHX_STAT_CD_desp", all.x = T)
+tx1 = tx1[, -which(colnames(tx1) %in% c("MELD_tx_desp", "MELD_tx"))]
+colnames(tx1)[which(colnames(tx1) == "new_CANHX_STAT_CD_desp")] = "MELD_tx"
+
+temp = sapply(c(1:nrow(tx1)), function(i) {ifelse(tx1$MELD[i] == tx1$MELD_tx[i], 1, 0)})
+
+summary(temp)
+rm(df_trans)
+```
+
+
+```{r}
+# length(setdiff(unique(dff$PX_ID), tx1$PX_ID)) INCREASES from 726 to 6504!
+tx1 = subset(tx1, CAN_last_MELD %in% c("MELD/PELD 6-14", "MELD/PELD 15-28", "MELD/PELD 29-32", "MELD/PELD 33-34", "MELD/PELD 35-36", "MELD/PELD >36"))
+table(tx1$CAN_last_MELD)
+
+```
+
+
+# Only considering cases where "TFL_FAIL_DT" is known ('dff' file):
+```{r}
+dff$surv_days = difftime(dff$TFL_FAIL_DT, dff$REC_TX_DT , units = c("days"))
+summary(dff$surv_days)
+dff$surv_days = as.numeric(dff$surv_days)
+
+temp = data.table(dff)[, list(cnt = .N), by = list(PX_ID)]; temp = subset(temp, cnt>1)
+temp1 = subset(dff, PX_ID == 866614)
+
+tx1_fail_dt = merge(tx1, unique(dff[, c("PX_ID", "surv_days")]))
+```
+
+```{r}
+m = lm(surv_days ~ MELD, data = tx1_fail_dt)
+summary(m)
+
+temp = data.table(tx1_fail_dt)[, list(mean_surv = mean(surv_days)), by = list(MELD)]     # Non-monotonic behavior!!!!
+# Very high value for "MELD >36", suggesting that there might be some issues in the data. --> Thus, can't use the model based on 'tx1_fail_dt'!
+```
+
+
+```{r}
+df$follow_time = difftime(df$TFL_PX_STAT_DT, df$REC_TX_DT , units = c("days"))
+df$follow_time = as.numeric(df$follow_time)
+
+# Checking if 'TFL_FOL_CD' is accurate: YES!
+temp = data.table(df)[, list(mean_follow_time = mean(follow_time)), by = list(TFL_FOL_CD)]
+
+table(df$TFL_GRAFT_STAT)
+
+# Adding the 'patient' and 'donor' information:
+df1 = merge(df, tx1, by = "PX_ID")
+
+```
+
+# Rough:
+```{r}
+df1 = subset(df1, TFL_GRAFT_STAT %in% c("N", "Y"))
+df1 = subset(df1, follow_time > 330 & (follow_time < 400))
+summary(df1$follow_time); uniqueN(df1$PX_ID)
+
+temp = data.table(df1)[, list(p_died = sum(TFL_GRAFT_STAT == "N")/.N), by = list(MELD)]
+
+df1$Died = ifelse(df1$TFL_GRAFT_STAT == "N", 1, 0)
+m = lm(Died ~ MELD + age_type + race_type + cod_type + dcd_type + rec_age_type + rec_life_sup + rec_med_cond, data = df1)
+summary(m)
+```
+
+# Death event censoring:
+```{r}
+df1 = subset(df1, TFL_GRAFT_STAT %in% c("N", "Y"))
+
+df1$Died = ifelse(df1$TFL_GRAFT_STAT == "N", 1, 0)
+```
+
+# Preparing data in the format for analysis:
+```{r}
+summary(df1$follow_time); uniqueN(df1$PX_ID)
+
+temp = subset(df1, (follow_time > 0) & (follow_time < 10000))
+
+df2 = data.table(temp)[, max_follow_flag := ifelse(follow_time == max(follow_time), 1, 0), by = list(PX_ID)]
+df2 = subset(df2, max_follow_flag == 1); uniqueN(df2$PX_ID)
+
+temp = data.table(df2)[, list(cnt = .N), by = list(PX_ID)]
+df2 = subset(df2, !(PX_ID %in% temp[temp$cnt > 1, ]$PX_ID))
+
+df2 = droplevels(df2)
+
+df2 = subset(df2, age_type != "A1")
+
+uniqueN(df2[, c("age_type", "race_type", "cod_type", "dcd_type")])
+```
+
+# Survival modeling, Cox-Proportional hazards model (Source: https://www.emilyzabor.com/tutorials/survival_analysis_in_r_tutorial.html#Part_1:_Introduction_to_Survival_Analysis):
+```{r}
+Surv(df2$follow_time, df2$Died)[1:10]
+
+f1 <- survfit(Surv(follow_time, Died) ~ 1, data = df2)
+
+# names(f1)
+
+plot(survfit(Surv(follow_time, Died) ~ 1, data = df2), 
+     xlab = "Days", 
+     ylab = "Overall survival probability")
+```
+
+```{r}
+# Estimate the probability of survivng to 1 year:
+cond = (df2$CAN_last_MELD == "MELD/PELD 15-28") & (df2$rec_age_type == "RA2") & (df2$rec_life_sup == "No") & (df2$rec_med_cond == "NH") & 
+  (df2$age_type == "A2") & (df2$race_type == "White") & (df2$cod_type == "Other") & (df2$dcd_type == "No") & (df2$sharing_type == "local"); sum(cond)
+
+# df2$temp = paste0(df2$CAN_last_MELD, df2$rec_age_type, df2$rec_life_sup, df2$rec_med_cond, df2$age_type, df2$race_type, df2$cod_type, df2$dcd_type, df2$sharing_type, sep = "_")
+# sort(table(df2$temp), decreasing = T)
+
+summary(survfit(Surv(follow_time, Died) ~ 1, data = df2[cond, ]), times = 365.25)
+
+# Comparing survival times between groups:
+survdiff(Surv(follow_time, Died) ~ CAN_last_MELD, data = df2)    # INIT_MELD_col_desp, "rec_age_type", "rec_life_sup", "rec_med_cond"
+```
+
+```{r}
+# The Cox regression model
+df2$CAN_last_MELD = relevel(as.factor(df2$CAN_last_MELD), ref = "MELD/PELD 15-28")
+df2$rec_age_type = relevel(as.factor(df2$rec_age_type), ref = "RA2")
+df2$rec_life_sup = relevel(as.factor(df2$rec_life_sup), ref = "No")
+df2$rec_med_cond = relevel(as.factor(df2$rec_med_cond), ref = "NH")
+df2$age_type = relevel(as.factor(df2$age_type), ref = "A2")
+df2$race_type = relevel(as.factor(df2$race_type), ref = "White")
+df2$cod_type = relevel(as.factor(df2$cod_type), ref = "Other")
+df2$dcd_type = relevel(as.factor(df2$dcd_type), ref = "No")
+df2$sharing_type = relevel(as.factor(df2$sharing_type), ref = "local")
+  
+mv_fit = coxph(Surv(follow_time, Died) ~ CAN_last_MELD + rec_age_type + rec_life_sup + rec_med_cond +
+        age_type + race_type + cod_type + dcd_type + sharing_type, data = df2)    # INIT_MELD_col_desp, "rec_age_type", "rec_life_sup", "rec_med_cond"   # Coeff. order more or less reasonable: ...MELD 6-14 has higher chances of death than MELD>36!
+
+mv_fit
+# If the "HR = exp(coef)" is high, then it means that HIGHER propensity of DEATH!; therefore, compared to MELD>36, <1 for lower MELD is expected!
+```
+
+
+```{r}
+# Hypothesis test of whether the effect of each covariate differs according to time, and a global test of all covariates at once.
+# 1. This is done by testing for an interaction effect between the covariate and log(time)
+#    A significant p-value indicates that the proportional hazards assumption is violated
+# 2. Plots of the Schoenfeld residuals
+#    Deviation from a zero-slope line is evidence that the proportional hazards assumption is violated; In our case, the assmptions seem to hold true for t that is not large!
+cz <- cox.zph(mv_fit)
+print(cz)
+plot(cz)
+```
+
+
+# Calculate cumulative HZ ratio:
+```{r}
+haz_ratio_TX_S1_OLD = function(txf, i) {     # 1 year transplant survival model (after a transplant)
+  val = 0
+  
+  x = txf$CAN_last_MELD[i]
+  if (x == "MELD/PELD 6-14") {val = val + 0.18379}
+  else if (x == "MELD/PELD 29-32") {val = val + -0.09977}
+  else if (x == "MELD/PELD 33-34") {val = val + -0.29679}
+  else if (x == "MELD/PELD 35-36") {val = val + -0.09697}
+  else if (x == "MELD/PELD >36") {val = val + 0.05475}
+  
+  x = txf$rec_age_type[i]     # Recipient age
+  if (x == "RA1") {val = val + 0.41437}
+  else if (x == "RA3") {val = val + -0.42811}
+  
+  x = txf$rec_life_sup[i]
+  if (x == "Yes") {val = val + 0.10661}
+  
+  x = txf$rec_med_cond[i]
+  if (x == "H") {val = val + 0.17865}
+  else if (x == "ICU") {val = val + 0.08382}
+  
+  x = txf$age_type[i]
+  if (x == "A3") {val = val + 0.30749}
+  else if (x == "A4") {val = val + 0.46310}
+  else if (x == "A5") {val = val + 0.59875}
+  
+  x = txf$race_type[i]
+  if (x == "Other") {val = val + 0.06983}
+  
+  x = txf$cod_type[i]
+  if (x == "Anoxia") {val = val + -0.17579}
+  else if (x == "CVA") {val = val + 0.09200}
+  
+  x = txf$dcd_type[i]
+  if (x == "Yes") {val = val + 0.44738}
+  
+  return (exp(val))
+}
+
+haz_ratio_TX_S1 = function(txf, i) {     # 1 year transplant survival model (after a transplant)
+  val = 0
+  
+  if ("CAN_last_MELD" %in% colnames(txf)) {
+    x = txf$CAN_last_MELD[i]
+  } else {
+    x = txf[, grep("MELD", colnames(txf))][i]
+  }
+  
+  if (x == "MELD/PELD 6-14") {val = val + 0.120822}
+  else if (x == "MELD/PELD 29-32") {val = val + -0.090220}
+  else if (x == "MELD/PELD 33-34") {val = val + -0.288600}
+  else if (x == "MELD/PELD 35-36") {val = val + -0.083587}
+  else if (x == "MELD/PELD >36") {val = val + 0.041135}
+  
+  x = txf$rec_age_type[i]     # Recipient age
+  if (x == "RA1") {val = val + 0.414899}
+  else if (x == "RA3") {val = val + -0.430238}
+  
+  x = txf$rec_life_sup[i]
+  if (x == "Yes") {val = val + 0.088432}
+  
+  x = txf$rec_med_cond[i]
+  if (x == "H") {val = val + 0.168527}
+  else if (x == "ICU") {val = val + 0.084504}
+  
+  x = txf$age_type[i]
+  if (x == "A3") {val = val + 0.303410}
+  else if (x == "A4") {val = val + 0.457029}
+  else if (x == "A5") {val = val + 0.579030}
+  
+  x = txf$race_type[i]
+  if (x == "Other") {val = val + 0.075161}
+  
+  x = txf$cod_type[i]
+  if (x == "Anoxia") {val = val + -0.176252}
+  else if (x == "CVA") {val = val + 0.092274}
+  
+  x = txf$dcd_type[i]
+  if (x == "Yes") {val = val + 0.441799}
+  
+  x = txf$sharing_type[i]
+  if (x == "national") {val = val + 0.294860}
+  else if (x == "regional") {val = val + 0.001408}
+  
+  return (exp(val))
+}
+
+haz_ratio_WL_S1 = function(wl1, i) {     # 1 year WL survival model (without a transplant)
+  val = 0
+  
+  if ("CAN_last_MELD" %in% colnames(wl1)) {
+    x = wl1$INIT_MELD_col_desp[i]
+  } else {
+    x = wl1[, grep("MELD", colnames(wl1))][i]
+  }
+
+  if (x == "MELD/PELD 6-14") {val = val + -0.79969}
+  else if (x == "MELD/PELD 29-32") {val = val + 1.28814}
+  else if (x == "MELD/PELD 33-34") {val = val + 1.50085}
+  else if (x == "MELD/PELD 35-36") {val = val + 1.78703}
+  else if (x == "MELD/PELD >36") {val = val + 2.41966}
+  
+  x = wl1$rec_age_type[i]     # Recipient age
+  if (x == "RA1") {val = val + -0.46244}
+  else if (x == "RA3") {val = val + 0.24969}
+  
+  x = wl1$rec_life_sup[i]
+  if (x == "Yes") {val = val + 0.98034}
+  
+  x = wl1$rec_med_cond[i]
+  if (x == "H") {val = val + 0.50202}
+  else if (x == "ICU") {val = val + 0.72883}
+  
+  return (exp(val))
+}
+```
+
+# Survival benefit of transplantation:
+```{r}
+df3 = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/DSA/Two_pat_types_Ref_change/share15/Uti_sim/df_tx_share15.csv"), stringsAsFactors = F)
+temp = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/DSA/Two_pat_types_Ref_change/share35/Uti_sim/df_tx_share35.csv"), stringsAsFactors = F)
+df3 = rbind.fill(df3, temp)
+temp = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/TC/Two_pat_types_Ref_change/acuity_circles/Uti_sim/df_tx_acuity_circles.csv"), stringsAsFactors = F)
+df3 = rbind.fill(df3, temp)
+temp = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/TC/Two_pat_types_Ref_change/acuity_circles/Uti_sim_sharing_type_mod/df_tx_acuity_circles.csv"), stringsAsFactors = F)
+temp$policy = "acuity_circles_sharing_type_mod"
+df3 = rbind.fill(df3, temp)
+temp = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/DSA/Two_pat_types_Ref_change/sd_match/500 NM/Uti_sim/df_tx_sd_match.csv"), stringsAsFactors = F)
+df3 = rbind.fill(df3, temp)
+temp = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/TC/Two_pat_types_Ref_change/sd_match_TC/Uti_sim/df_tx_sd_match_TC.csv"), stringsAsFactors = F)
+df3 = rbind.fill(df3, temp)
+temp = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/TC/Two_pat_types_Ref_change/sd_match_TC/600 NM/Uti_sim/df_tx_sd_match_TC.csv"), stringsAsFactors = F)
+temp$policy = "sd_match_TC_600NM"
+df3 = rbind.fill(df3, temp)
+temp = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/DSA/Two_pat_types_Ref_change/one_region/Uti_sim/df_tx_one_region.csv"), stringsAsFactors = F)
+df3 = rbind.fill(df3, temp)
+temp = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/DSA/Two_pat_types_Ref_change/uti_pref/Uti_sim/df_tx_uti_pref.csv"), stringsAsFactors = F)
+df3 = rbind.fill(df3, temp)
+temp = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/Nation/DSA/Two_pat_types_Ref_change/max_benefit/Uti_sim/df_tx_max_benefit.csv"), stringsAsFactors = F)
+df3 = rbind.fill(df3, temp)
+
+table(df3$policy)
+# df3 = rbind.fill(df3, temp)
+
+sum(is.na(df3$EU_vec_col))
+temp = data.table(df3)[, list(mean_EU = mean(EU_vec_col)), by = list(policy)]
+
+nrow(df3) / (max(df3$iter) * uniqueN(df3$policy))
+
+# Transplant survival at the end of 1 year!
+df3$CAN_last_MELD = df3$current_MELD
+df3$TX_hr = sapply(c(1:nrow(df3)), function(i) {haz_ratio_TX_S1(df3, i)})
+
+# Baseline survival function (at t=1 year):
+S0_TX = 0.98    # 0.979 for OLDer version without 'sharing_type'
+df3$TX_S1 = S0_TX^df3$TX_hr  
+summary(df3$TX_S1) 
+
+# Waiting list survival at the end of 1 year!
+df3$INIT_MELD_col_desp = df3$current_MELD    # CANNOT BE "current_MELD"!!!...has to be INITIAL MELD????!
+df3$WL_hr = sapply(c(1:nrow(df3)), function(i) {haz_ratio_WL_S1(df3, i)})
+
+## Baseline survival function (at t=1 year):
+S0_WL = 0.875    # 0.898
+df3$WL_S1 = S0_WL^df3$WL_hr  
+
+# Define "benefit" from transplant:
+df3$benefit = df3$TX_S1 - df3$WL_S1
+# df3$benefit = df3$mean_GSi - df3$WL_S1
+summary(df3$benefit)    # Should be POSITIVE!!!!
+
+temp = data.table(df3)[, list(mean_benefit = mean(benefit)), by = list(policy)]
+plot(temp$policy, temp$mean_benefit)
+
+df3$MELD = gsub("/PELD ", " ", df3$current_MELD)
+  
+# df3$policy = factor(df3$policy, levels = c("share15", "share35", "acuity_circles", "one_region", "sd_match", "uti_pref"))
+df3$MELD = factor(df3$MELD, levels = c("MELD 6-14", "MELD 15-28", "MELD 29-32", "MELD 33-34", "MELD 35-36", "MELD >36"))
+
+ggplot(df3, aes(x=as.factor(policy), y=benefit, color=as.factor(policy))) +
+  geom_boxplot()
+
+ggplot(df3, aes(x=as.factor(policy), y=benefit, fill=as.factor(MELD))) +
+  geom_boxplot()
+
+```
+
+# 'mean_GSi' as a function of "donor/organ" and "patient" characteristics: NOT REQUIRED!
+```{r}
+ref1 = read.csv(paste0(fol_, "/Analysis/temp_Julia/mean_GSi_G6AC_48org_det_waitcost_NoN_after_Y_3RA.csv"), stringsAsFactors = F)
+ref1$new_PTR_STAT_CD_desp = factor(ref1$new_PTR_STAT_CD_desp, levels = c("MELD/PELD 6-14", "MELD/PELD 15-28", "MELD/PELD 29-32", "MELD/PELD 33-34", "MELD/PELD 35-36", "MELD/PELD >36"))
+m = lm(mean_GSi ~ new_PTR_STAT_CD_desp + rec_age_type + rec_life_sup + rec_med_cond + type, data = ref1); summary(m)
+```
+
+##############
+
+
+```{r}
+quantile(df3$benefit, 0.01); quantile(df3$benefit, 0.99)
+cond = (df3$benefit >= quantile(df3$benefit, 0.01)) & (df3$benefit <= quantile(df3$benefit, 0.99))
+temp = data.table(df3[, ])[, list(mean_benefit = mean(benefit)), by = list(policy)]
+table(df3$policy)
+```
+
+# Adding "Distance" traveled (v1): (Using Sommer's file that has info ONLY on DSA-DSA distance!)
+```{r}
+# In "miles" as dist(AROR(TC:ARUA), DCTC(TC:DCGU))=905, As per google, driving dist is 1013 miles, Similarly, dist(NYFL(TC:NYFL), NEOR(TC:NEUN))=1052, As per google, driving dist is 951 miles
+df_opo_dist_S = read_excel('/Users/sakshat/Google Drive/Health Care/Optimized Overlapping Organ Allocation/opo_distances_populationweighted.xlsx', sheet=2)    # Transplant Volume weighted transport distance between DSAs      # SHEET=2 has distances modified or HIOP and PRLL!!!
+df_opo_dist_S = data.frame(df_opo_dist_S)   
+df_opo_dist_S = df_opo_dist_S[-1, -c(2, ncol(df_opo_dist_S))]
+df_opo_dist_S[, 1] = as.character(df_opo_dist_S[, 1])
+df_opo_dist_S[df_opo_dist_S[, 1] == "CTHH", 1] = "CTOP"
+colnames(df_opo_dist_S)[which(colnames(df_opo_dist_S) == "CTHH")] = "CTOP"
+
+fetch_val = function(opo1, opo2, df1) {   # Assuming symmetric values
+  row_opo1 = which(df1[, 1]==opo1)
+  #row_opo2 = which(df1[, 1]==opo2)
+  if (opo2 %in% c("WISE", "ZCAN")) {
+    return (NA)
+  }
+  val = df1[row_opo1, opo2]  
+  return (as.numeric(val))
+}
+
+df3$dist_miles = sapply(c(1:nrow(df3)), function(i) {fetch_val(df3$CAN_OPO_CD[i], df3$DON_OPO_CTR_CD[i], df_opo_dist_S)})
+
+summary(df3$dist_miles)
+
+table(df3$policy)
+temp = data.table(df3[, ])[, list(cnt = .N, mean_distance = mean(dist_miles, na.rm = T),
+                                  first_q = quantile(dist_miles, 0.25, na.rm = T),
+                                  median_distance = median(dist_miles, na.rm = T),
+                                  third_q = quantile(dist_miles, 0.75, na.rm = T)), by = list(policy)]
+```
+
+# Adding "Distance" traveled (v2): (Using OWN calculation and using Sommer's data for few records, see the SOURCE CODE below)
+```{r}
+df_opo_dist = read.csv(paste0(fol_, "/Analysis/tx_vol_wt_dist_NM_sym.csv"), stringsAsFactors = F)
+
+# Symmetric values:
+f = function(opo1, opo2) {
+  val = sort(c(opo1, opo2))
+  return (paste0(val[1], "_", val[2]))
+}
+
+df3$DSA1_DSA2 = sapply(c(1:nrow(df3)), function(i) {f(df3$DON_OPO_CTR_CD[i], df3$CAN_OPO_CD[i])})
+
+df3 = merge(df3, df_opo_dist[, c("DSA1_DSA2", "tx_vol_wt_dist_NM")], by = "DSA1_DSA2", all.x = T)
+sum(is.na(df3$tx_vol_wt_dist_NM)) / nrow(df3)
+
+temp = subset(df3, is.na(tx_vol_wt_dist_NM))
+temp = unique(temp[, c("DON_OPO_CTR_CD", "CAN_OPO_CD")])
+
+# For 'records' not found, refer to Sommer's data:
+temp$dist_NM = sapply(c(1:nrow(temp)), function(i) {fetch_val(temp$CAN_OPO_CD[i], temp$DON_OPO_CTR_CD[i], df_opo_dist_S) / 1.15078})    # To convert to NM
+temp$DSA1_DSA2 = sapply(c(1:nrow(temp)), function(i) {f(temp$DON_OPO_CTR_CD[i], temp$CAN_OPO_CD[i])})
+temp = unique(temp[, c("DSA1_DSA2", "dist_NM")]); uniqueN(temp$DSA1_DSA2)
+
+df3 = merge(df3, temp[, c("DSA1_DSA2", "dist_NM")], by = "DSA1_DSA2", all.x = T)
+sum(!is.na(df3$dist_NM)) + sum(!is.na(df3$tx_vol_wt_dist_NM))
+
+temp = subset(df3, is.na(tx_vol_wt_dist_NM) & is.na(dist_NM))     # 0.09511309 %
+temp = unique(temp[, c("DON_OPO_CTR_CD", "CAN_OPO_CD")])   # All are for "WISE" and "ZCAN". Skip them.
+
+# Add 'exact' distance for "Acuity Circles" type of policies:
+sum(!is.na(df3$don_hosp_id))
+df_donor_trnspl_dist = read.csv(paste0(fol_, '/Analysis/dist_don_hosp_txc.csv'), stringsAsFactors = F)
+df3 = merge(df3, df_donor_trnspl_dist[, c("don_hosp_id", "can_listing_ctr_cd", "Distance.nm.")], by.x = c("don_hosp_id", "TC"), by.y = c("don_hosp_id", "can_listing_ctr_cd"), all.x = T)
+sum(!is.na(df3$Distance.nm.))
+```
+
+
+```{r}
+df31 = df3[!(df3$DON_OPO_CTR_CD %in% c("HIOP", "PRLL")) & !(df3$CAN_OPO_CD %in% c("HIOP", "PRLL")), ]
+df31$final_dist_NM = df31$tx_vol_wt_dist_NM
+
+# Incorporate 'dist_NM' (Sommer's data):
+cond = is.na(df31$final_dist_NM) & !is.na(df31$dist_NM)
+df31[cond, "final_dist_NM"] = df31[cond, "dist_NM"]
+summary(df31$final_dist_NM)
+
+# Incorporate 'exact' distance for "Acuity Circles" type of policies:
+cond = !is.na(df31$Distance.nm.)
+df31[cond, "final_dist_NM"] = df31[cond, "Distance.nm."]
+summary(df31$final_dist_NM)
+
+sum(is.na(df31$final_dist_NM))
+
+temp = data.table(df31[, ])[, list(cnt = .N, mean_distance = mean(final_dist_NM, na.rm = T),
+                                  first_q = quantile(final_dist_NM, 0.25, na.rm = T),
+                                  median_distance = median(final_dist_NM, na.rm = T),
+                                  third_q = quantile(final_dist_NM, 0.75, na.rm = T)), by = list(policy)]
+```
+
+
+
+
+# SOURCE CODE: Volume-weighted distance (DSA-DSA):
+```{r}
+df_donor_trnspl_dist = read.csv(paste0(fol_, '/Analysis/dist_don_hosp_txc.csv'), stringsAsFactors = F)
+
+df_donor_trnspl_dist$don_DSA = substr(df_donor_trnspl_dist$don_hosp_id, 1, 4)
+
+ref = read.csv(paste0(fol_, "/R_files/Equilibrium/Input_data/vlookup_TC_DSA_Region.csv"), stringsAsFactors = F)
+df_donor_trnspl_dist = merge(df_donor_trnspl_dist, unique(ref[, c("transplant_center", "OPO")]), by.x = "can_listing_ctr_cd", by.y = "transplant_center", all.x = T)
+colnames(df_donor_trnspl_dist)[which(colnames(df_donor_trnspl_dist) == "OPO")] = "can_DSA"
+
+# Transplant volume:
+tx = read.csv(paste0(fol_, "/Analysis/tx.csv"), stringsAsFactors = F)
+tx$date <- as.Date(tx$date, format= "%Y-%m-%d")
+min(tx$date); max(tx$date)
+
+setdiff(unique(tx$REC_CTR_CD), unique(df_donor_trnspl_dist$can_listing_ctr_cd))    # "ARCH" not found; "REC_CTR_CD" is the trnasplant center
+
+## Import 'don_hosp_id' using DONOR_ID:
+ref1 = read.csv(paste0(fol_, "/From SRTR/Donor_files/deceasedtodonhosp.csv"), stringsAsFactors = F)
+ref1$don_hosp_id = paste0(ref1$DON_OPO_CTR_CD, ref1$DON_HOSP_PROV_NUM, ref1$DON_HOSP_PROV_TY)
+ref1 = subset(ref1, don_hosp_id != "")
+
+tx = merge(tx, ref1[, c("DONOR_ID", "don_hosp_id")], by = "DONOR_ID", all.x = T)
+sum(is.na(tx$don_hosp_id))
+tx = subset(tx, !is.na(don_hosp_id))
+
+df_vol = data.table(tx)[, list(cnt = .N), by = list(don_hosp_id, REC_CTR_CD)]
+colnames(df_vol)[2] = "can_listing_ctr_cd"
+df_vol = merge(df_donor_trnspl_dist, df_vol)
+
+# Calculate 'transplant volumne weighted distance in NM':
+temp = data.table(df_vol)[, list(tx_vol_wt_dist_NM = weighted.mean(Distance.nm., cnt)), by = list(don_DSA, can_DSA)]
+
+write.csv(temp, paste0(fol_, "/Analysis/tx_vol_wt_dist_NM.csv"), row.names = F)
+
+# Symmetric values:
+f = function(opo1, opo2) {
+  val = sort(c(opo1, opo2))
+  return (paste0(val[1], "_", val[2]))
+}
+
+temp$DSA1_DSA2 = sapply(c(1:nrow(temp)), function(i) {f(temp$don_DSA[i], temp$can_DSA[i])})
+temp1 = data.table(temp)[, list(tx_vol_wt_dist_NM = mean(tx_vol_wt_dist_NM)), by = list(DSA1_DSA2)]
+temp1$DSA1 = sapply(c(1:nrow(temp1)), function(i) {strsplit(temp1$DSA1_DSA2[i], "_")[[1]][1]})
+temp1$DSA2 = sapply(c(1:nrow(temp1)), function(i) {strsplit(temp1$DSA1_DSA2[i], "_")[[1]][2]})
+
+write.csv(temp1[, c("DSA1", "DSA2", "DSA1_DSA2", "tx_vol_wt_dist_NM")], paste0(fol_, "/Analysis/tx_vol_wt_dist_NM_sym.csv"), row.names = F)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
